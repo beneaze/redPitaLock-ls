@@ -5,6 +5,8 @@ dual-channel PID lockbox, powered by
 [wwlyn's modified PyRPL fork](https://github.com/wwlyn/pyrpl_change)
 (branch `max_hold_no_iir_improvement`).
 
+For a **full Windows + BLACS walkthrough** (versions, install order, `register_classes` pitfalls, and errors we hit), see [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md).
+
 ## Features
 
 - Two independent PID loops (pid0/pid1) on in1/out1 and in2/out2
