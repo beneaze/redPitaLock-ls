@@ -197,6 +197,7 @@ The example connection table uses **`10.0.0.15`** (from the existing `redPitaLoc
 - [ ] **Compile** connection table (`labscript_init` or Run Manager)  
 - [ ] **BLACS** only one instance, or free port **42517**  
 - [ ] Red Pitaya **IP** correct and reachable  
+- [ ] Worker has **`QCoreApplication`** (handled in `blacs_workers.py`); PyRPL numpy patches applied if needed  
 
 ---
 
@@ -235,6 +236,25 @@ Replace all occurrences of `dtype=np.complex` with `dtype=complex` and `dtype=np
 ### 3. `pyrpl/pyrpl.py` -- don't crash on non-essential software modules
 
 In `load_software_modules()`, change `raise e` to `continue` so that errors in non-essential modules (e.g. lockbox division-by-zero on fresh config) are logged but don't kill the entire init.
+
+---
+
+## BLACS worker: Qt event loop, scope acquisition, and ASG
+
+The hardware worker runs in a **separate process**. PyRPL’s `scope.single()` completes via a nested **`QEventLoop`** (`pyrpl.async_utils`). Without a **`QCoreApplication`** in that process, scope acquisitions can fail or return empty data, which shows up as **blank PSD / histogram** plots in the BLACS tab.
+
+**Implemented in `rp_lockbox/blacs_workers.py`:** at the start of `RPLockboxWorker.init()`, if `QCoreApplication.instance()` is `None`, create `QCoreApplication(sys.argv)` before constructing `Pyrpl(...)`.
+
+**Live voltage traces** use **`rp.scope.voltage_in1` / `voltage_in2`** and **`voltage_out1` / `voltage_out2`** (calibrated scope registers), not `rp.sampler.*`, so the monitor matches what you expect at the BNCs.
+
+**Scope traces for PSD / stats** are parsed defensively: `scope.single()` may return a **tuple** `(ch1, ch2)`, a **2×N** array, or a single 1D trace. The worker selects the row for the requested channel. `scope.trace_average = 1` is set before each shot for a fast single acquisition.
+
+**Manual ASG (DC, triangle, square, sine):**
+
+- **Never set ASG `frequency` to 0** — use a placeholder (e.g. 1 kHz) for **DC**; for other waveforms clamp to a small minimum (e.g. 0.1 Hz).
+- **DC:** waveform table is all zeros; use **`amplitude=1.0`** and set the desired level with **`offset`** (volts).
+- **Triangle / square / sine:** after `setup`, set **`asg.periodic = True`** so the generator repeats continuously instead of stopping after one cycle.
+- Call **`asg.trig()`** when available (PyRPL pattern: `immediately` then `off`) to re-arm the trigger after `setup`.
 
 ---
 

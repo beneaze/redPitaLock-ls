@@ -1,5 +1,7 @@
 import os
+import sys
 import time
+import logging
 import threading
 from collections import deque
 
@@ -16,9 +18,28 @@ if not hasattr(np, 'complex'):
 
 from blacs.tab_base_classes import Worker
 
+LOG = logging.getLogger(__name__)
+
+# ASG: never use frequency=0 (invalid for internal timing). DC uses a dummy Hz.
+ASG_MIN_FREQ_HZ = 0.1
+ASG_DC_FREQ_PLACEHOLDER_HZ = 1e3
+
+
+def _extract_scope_trace(raw, channel):
+    """Normalize scope.single() return to a 1D float array for ADC channel 0 or 1."""
+    ch = int(channel)
+    if isinstance(raw, (list, tuple)) and len(raw) > ch:
+        return np.asarray(raw[ch], dtype=np.float64).ravel()
+    arr = np.asarray(raw, dtype=np.float64)
+    if arr.ndim == 2 and arr.shape[0] > ch:
+        return np.asarray(arr[ch], dtype=np.float64).ravel()
+    if arr.ndim == 1 and arr.size > 0:
+        return arr.ravel()
+    return np.asarray([], dtype=np.float64)
+
 
 class AccumulatorThread(threading.Thread):
-    """Background thread that polls sampler at ~100 Hz into ring buffers."""
+    """Background thread that polls scope voltages at ~100 Hz into ring buffers."""
 
     RATE_HZ = 100
     BUFLEN = 2000  # ~20 s of data
@@ -43,10 +64,11 @@ class AccumulatorThread(threading.Thread):
         while not self.stop.is_set():
             t = time.monotonic() - self.t0
             try:
-                v_in1 = float(self.rp.sampler.in1)
-                v_in2 = float(self.rp.sampler.in2)
-                v_out1 = float(self.rp.sampler.out1)
-                v_out2 = float(self.rp.sampler.out2)
+                sc = self.rp.scope
+                v_in1 = float(sc.voltage_in1)
+                v_in2 = float(sc.voltage_in2)
+                v_out1 = float(sc.voltage_out1)
+                v_out2 = float(sc.voltage_out2)
                 with self.lock:
                     self.bufs['time'].append(t)
                     self.bufs['in1'].append(v_in1)
@@ -72,7 +94,13 @@ class AccumulatorThread(threading.Thread):
 class RPLockboxWorker(Worker):
 
     def init(self):
+        from qtutils.qt.QtCore import QCoreApplication
         from pyrpl import Pyrpl
+
+        # PyRPL scope.single() uses QEventLoop; BLACS worker runs in a subprocess
+        # without a default Qt core application unless we create one here.
+        if QCoreApplication.instance() is None:
+            QCoreApplication(sys.argv)
 
         self.p = Pyrpl(config='rp_lockbox', hostname=self.ip_addr, gui=False)
         self.rp = self.p.rp
@@ -237,49 +265,57 @@ class RPLockboxWorker(Worker):
         """Acquire scope burst and compute Welch PSD."""
         from scipy.signal import welch
 
-        scope = self.rp.scope
-        scope.input1 = self.inputs[channel]
-        scope.decimation = decimation
-        scope.trigger_source = 'immediately'
-        fs = 125e6 / decimation
+        try:
+            scope = self.rp.scope
+            scope.trace_average = 1
+            scope.input1 = self.inputs[channel]
+            scope.decimation = decimation
+            scope.trigger_source = 'immediately'
+            fs = 125e6 / decimation
 
-        trace = np.asarray(scope.single(), dtype=np.float64)
-        if trace.ndim > 1:
-            trace = trace[0]
-        if trace.size == 0:
+            raw = scope.single()
+            trace = _extract_scope_trace(raw, channel)
+            if trace.size == 0:
+                return {'freqs': [], 'psd': [], 'rms': 0.0}
+
+            nperseg = min(1024, trace.size)
+            freqs, psd_vals = welch(trace, fs=fs, nperseg=nperseg)
+            rms = float(np.sqrt(np.trapz(psd_vals, freqs)))
+            return {
+                'freqs': freqs.tolist(),
+                'psd': psd_vals.tolist(),
+                'rms': rms,
+            }
+        except Exception:
+            LOG.exception('compute_psd failed (channel=%s)', channel)
             return {'freqs': [], 'psd': [], 'rms': 0.0}
-
-        nperseg = min(1024, trace.size)
-        freqs, psd_vals = welch(trace, fs=fs, nperseg=nperseg)
-        rms = float(np.sqrt(np.trapz(psd_vals, freqs)))
-        return {
-            'freqs': freqs.tolist(),
-            'psd': psd_vals.tolist(),
-            'rms': rms,
-        }
 
     def get_stats(self, channel, decimation=64):
         """Acquire scope burst and return histogram statistics."""
-        scope = self.rp.scope
-        scope.input1 = self.inputs[channel]
-        scope.decimation = decimation
-        scope.trigger_source = 'immediately'
+        try:
+            scope = self.rp.scope
+            scope.trace_average = 1
+            scope.input1 = self.inputs[channel]
+            scope.decimation = decimation
+            scope.trigger_source = 'immediately'
 
-        trace = np.asarray(scope.single(), dtype=np.float64)
-        if trace.ndim > 1:
-            trace = trace[0]
-        if trace.size == 0:
+            raw = scope.single()
+            trace = _extract_scope_trace(raw, channel)
+            if trace.size == 0:
+                return {'mean': 0.0, 'std': 0.0, 'hist_counts': [], 'hist_edges': []}
+
+            mean = float(np.mean(trace))
+            std = float(np.std(trace))
+            counts, edges = np.histogram(trace, bins=50)
+            return {
+                'mean': mean,
+                'std': std,
+                'hist_counts': counts.tolist(),
+                'hist_edges': edges.tolist(),
+            }
+        except Exception:
+            LOG.exception('get_stats failed (channel=%s)', channel)
             return {'mean': 0.0, 'std': 0.0, 'hist_counts': [], 'hist_edges': []}
-
-        mean = float(np.mean(trace))
-        std = float(np.std(trace))
-        counts, edges = np.histogram(trace, bins=50)
-        return {
-            'mean': mean,
-            'std': std,
-            'hist_counts': counts.tolist(),
-            'hist_edges': edges.tolist(),
-        }
 
     # ── ASG waveform output ──────────────────────────────────────────
 
@@ -292,14 +328,34 @@ class RPLockboxWorker(Worker):
         pid.output_direct = 'off'
 
         wf_map = {'triangle': 'ramp', 'square': 'square', 'sine': 'sin', 'dc': 'dc'}
+        wf = wf_map.get(waveform, waveform)
+        off = float(offset)
+        amp = float(amplitude)
+        freq = float(frequency)
+
+        if wf == 'dc':
+            # DC table is zeros; use non-zero dummy frequency and non-zero amplitude scale.
+            freq_hz = ASG_DC_FREQ_PLACEHOLDER_HZ
+            amp_v = 1.0
+        else:
+            freq_hz = max(freq, ASG_MIN_FREQ_HZ)
+            amp_v = max(amp, 0.0)
+
         asg.setup(
-            waveform=wf_map.get(waveform, waveform),
-            frequency=float(frequency) if waveform != 'dc' else 0,
-            amplitude=float(amplitude) if waveform != 'dc' else 0,
-            offset=float(offset),
+            waveform=wf,
+            frequency=freq_hz,
+            amplitude=amp_v,
+            offset=off,
             trigger_source='immediately',
             output_direct=self.outputs[channel],
         )
+        # Re-arm trigger like PyRPL's Asg.trig() (immediately then off).
+        if hasattr(asg, 'trig'):
+            asg.trig()
+        if wf != 'dc':
+            # Continuous repeating output for ramp/square/sine.
+            asg.periodic = True
+
         self._asg_active[channel] = True
         return True
 
