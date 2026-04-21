@@ -200,6 +200,44 @@ The example connection table uses **`10.0.0.15`** (from the existing `redPitaLoc
 
 ---
 
+## PyRPL numpy compatibility patches (required)
+
+Even with `numpy < 2`, numpy 1.24+ removed several deprecated aliases (`np.complex`, `np.float`, `np.int`, `np.bool`, `np.object`, `np.str`) that PyRPL still uses throughout its codebase. These cause `AttributeError` crashes during `Pyrpl()` init (specifically in `network_analyzer.py` and other modules).
+
+**Three patches to the installed PyRPL package** are needed (all under `site-packages/pyrpl/`):
+
+### 1. `pyrpl/__init__.py` -- add numpy shims at the top
+
+After `import numpy as np`, add:
+
+```python
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", FutureWarning)
+    if not hasattr(np, 'complex'):
+        np.complex = complex
+    if not hasattr(np, 'float'):
+        np.float = float
+    if not hasattr(np, 'int'):
+        np.int = int
+    if not hasattr(np, 'bool'):
+        np.bool = bool
+    if not hasattr(np, 'object'):
+        np.object = object
+    if not hasattr(np, 'str'):
+        np.str = str
+```
+
+### 2. `pyrpl/software_modules/network_analyzer.py` -- replace `np.complex` with `complex`
+
+Replace all occurrences of `dtype=np.complex` with `dtype=complex` and `dtype=np.float` with `dtype=float`.
+
+### 3. `pyrpl/pyrpl.py` -- don't crash on non-essential software modules
+
+In `load_software_modules()`, change `raise e` to `continue` so that errors in non-essential modules (e.g. lockbox division-by-zero on fresh config) are logged but don't kill the entire init.
+
+---
+
 ## Summary table
 
 | Component | Version / choice | Reason |
