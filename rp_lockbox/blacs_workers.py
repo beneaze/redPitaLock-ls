@@ -74,7 +74,7 @@ class RPLockboxWorker(Worker):
     def init(self):
         from pyrpl import Pyrpl
 
-        self.p = Pyrpl(hostname=self.ip_addr)
+        self.p = Pyrpl(config='rp_lockbox', hostname=self.ip_addr, gui=False)
         self.rp = self.p.rp
 
         self.pids = [self.rp.pid0, self.rp.pid1]
