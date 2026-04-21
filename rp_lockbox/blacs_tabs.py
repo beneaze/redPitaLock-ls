@@ -1,10 +1,27 @@
 import os
 import math
+import logging
 
 os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
 
+LOG = logging.getLogger(__name__)
+
 from blacs.device_base_class import DeviceTab
-from blacs.tab_base_classes import define_state, MODE_MANUAL
+from blacs.tab_base_classes import (
+    define_state,
+    MODE_MANUAL,
+    MODE_BUFFERED,
+    MODE_TRANSITION_TO_BUFFERED,
+    MODE_TRANSITION_TO_MANUAL,
+)
+
+# Allow trace refresh + PSD/stats acquire while tab is manual, buffered, or transitioning.
+_ALL_DEVICE_MODES = (
+    MODE_MANUAL
+    | MODE_BUFFERED
+    | MODE_TRANSITION_TO_BUFFERED
+    | MODE_TRANSITION_TO_MANUAL
+)
 
 from qtutils.qt.QtCore import QTimer
 from qtutils.qt.QtWidgets import (
@@ -16,6 +33,33 @@ from qtutils.qt.QtCore import Qt
 
 import numpy as np
 import pyqtgraph as pg
+
+
+def _pad_log_range(lo, hi, pad_frac=0.08):
+    """Expand positive [lo, hi] symmetrically in log10 space (for PSD axis padding)."""
+    if lo <= 0 or hi <= 0 or not (math.isfinite(lo) and math.isfinite(hi)):
+        return lo, hi
+    log_lo = math.log10(lo)
+    log_hi = math.log10(hi)
+    span = max(log_hi - log_lo, 1e-12)
+    margin = span * pad_frac
+    return 10 ** (log_lo - margin), 10 ** (log_hi + margin)
+
+
+def _apply_psd_plot_ranges(plot_widget, freqs, psd, pad_frac=0.08):
+    """Set PSD PlotWidget X/Y ranges from data (log mode uses linear axis values)."""
+    fa = np.asarray(freqs, dtype=np.float64)
+    pa = np.asarray(psd, dtype=np.float64)
+    fa = fa[np.isfinite(fa) & (fa > 0)]
+    pa = pa[np.isfinite(pa) & (pa > 0)]
+    if fa.size == 0 or pa.size == 0:
+        return
+    f_lo, f_hi = float(np.min(fa)), float(np.max(fa))
+    p_lo, p_hi = float(np.min(pa)), float(np.max(pa))
+    f_lo, f_hi = _pad_log_range(f_lo, f_hi, pad_frac)
+    p_lo, p_hi = _pad_log_range(p_lo, p_hi, pad_frac)
+    plot_widget.setXRange(f_lo, f_hi, padding=0)
+    plot_widget.setYRange(p_lo, p_hi, padding=0)
 
 
 class ChannelPanel(QWidget):
@@ -32,12 +76,13 @@ class ChannelPanel(QWidget):
 
         left = QVBoxLayout()
         left.addWidget(self._build_pid_group())
+        left.addWidget(self._build_trace_options_group())
         left.addWidget(self._build_sequence_group())
         left.addWidget(self._build_waveform_group())
         left.addStretch()
 
         right_splitter = QSplitter(Qt.Vertical)
-        right_splitter.addWidget(self._build_trace_plot())
+        right_splitter.addWidget(self._build_trace_plots())
         right_splitter.addWidget(self._build_psd_plot())
         right_splitter.addWidget(self._build_stats_plot())
         right_splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -76,6 +121,13 @@ class ChannelPanel(QWidget):
         g.addWidget(self.pause_gains_combo, row, 1)
 
         row += 1
+        self.btn_apply_pid = QPushButton('Apply PID')
+        self.btn_apply_pid.setToolTip(
+            'Push setpoint, P, I, Ival, limits, and pause gains to the device.',
+        )
+        g.addWidget(self.btn_apply_pid, row, 0, 1, 2)
+
+        row += 1
         self.btn_enable = QPushButton('Enable PID')
         self.btn_enable.setStyleSheet('background: green; color: white;')
         self.btn_disable = QPushButton('Disable PID')
@@ -89,6 +141,18 @@ class ChannelPanel(QWidget):
         g.addWidget(self.btn_reset, row, 0)
         g.addWidget(self.btn_refresh, row, 1)
 
+        return grp
+
+    def _build_trace_options_group(self):
+        """Left-column controls for trace plots (kept here so they are not clipped by splitters)."""
+        grp = QGroupBox('Voltage traces')
+        v = QVBoxLayout(grp)
+        self.trace_show_setpoint_check = QCheckBox('Show setpoint line (input plot)')
+        self.trace_show_setpoint_check.setChecked(True)
+        self.trace_show_setpoint_check.setToolTip(
+            'Toggle the red dashed horizontal line on the input voltage plot (PID lock reference, V).',
+        )
+        v.addWidget(self.trace_show_setpoint_check)
         return grp
 
     # ── Setpoint Sequence ────────────────────────────────────────────
@@ -152,24 +216,54 @@ class ChannelPanel(QWidget):
 
     # ── Plots ────────────────────────────────────────────────────────
 
-    def _build_trace_plot(self):
+    def _build_trace_plots(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        self.trace_plot = pg.PlotWidget(title=f'Ch{self.ch} Voltage vs Time')
-        self.trace_plot.setLabel('bottom', 'Time', 's')
-        self.trace_plot.setLabel('left', 'Voltage', 'V')
-        self.trace_plot.showGrid(x=True, y=True)
-        self.trace_input_curve = self.trace_plot.plot(pen=pg.mkPen('y', width=2), name='Input')
-        self.trace_output_curve = self.trace_plot.plot(pen=pg.mkPen('c', width=2), name='Output')
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        inn = self.ch + 1
+        self.trace_input_plot = pg.PlotWidget(title=f'Ch{self.ch} Input (in{inn}) vs Time')
+        self.trace_input_plot.setLabel('bottom', 'Time', 's')
+        self.trace_input_plot.setLabel('left', 'Voltage', 'V')
+        self.trace_input_plot.showGrid(x=True, y=True)
+        self.trace_input_plot.setToolTip(
+            'Yellow: mean PID input from scope. Red dashed: setpoint (lock reference on PID input, V).',
+        )
+        self.trace_input_curve = self.trace_input_plot.plot(pen=pg.mkPen('y', width=2))
         self.trace_setpoint_line = pg.InfiniteLine(
             pos=0, angle=0, pen=pg.mkPen('r', width=1, style=Qt.DashLine),
         )
-        self.trace_plot.addItem(self.trace_setpoint_line)
-        legend = self.trace_plot.addLegend(offset=(10, 10))
-        legend.addItem(self.trace_input_curve, 'Input')
-        legend.addItem(self.trace_output_curve, 'Output')
-        lay.addWidget(self.trace_plot)
+        self.trace_setpoint_line.setToolTip(
+            'Setpoint: target voltage on the PID input (lock reference in V), not direct BNC output.',
+        )
+        self.trace_input_plot.addItem(self.trace_setpoint_line)
+        in_legend = self.trace_input_plot.addLegend(offset=(10, 10))
+        in_legend.addItem(self.trace_input_curve, 'Input (in)')
+
+        self.trace_output_plot = pg.PlotWidget(title=f'Ch{self.ch} Output (out{inn}) vs Time')
+        self.trace_output_plot.setLabel('bottom', 'Time', 's')
+        self.trace_output_plot.setLabel('left', 'Voltage', 'V')
+        self.trace_output_plot.showGrid(x=True, y=True)
+        self.trace_output_plot.setToolTip(
+            'Cyan: mean DAC output (out1/out2) from scope (BNC voltage).',
+        )
+        self.trace_output_curve = self.trace_output_plot.plot(pen=pg.mkPen('c', width=2))
+        out_legend = self.trace_output_plot.addLegend(offset=(10, 10))
+        out_legend.addItem(self.trace_output_curve, 'Out (BNC)')
+
+        self.trace_show_setpoint_check.toggled.connect(self._on_trace_setpoint_visibility_toggled)
+
+        trace_split = QSplitter(Qt.Vertical)
+        trace_split.addWidget(self.trace_input_plot)
+        trace_split.addWidget(self.trace_output_plot)
+        trace_split.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        lay.addWidget(trace_split, stretch=1)
         return w
+
+    def _on_trace_setpoint_visibility_toggled(self, checked):
+        # Do not bind toggled directly to QGraphicsItem.setVisible: that connection
+        # is unreliable across PyQt/pyqtgraph builds. Use an explicit Python callable.
+        self.trace_setpoint_line.setVisible(bool(checked))
 
     def _build_psd_plot(self):
         w = QWidget()
@@ -199,6 +293,15 @@ class ChannelPanel(QWidget):
         self.stats_plot.showGrid(x=True, y=True)
         self.stats_bar = pg.BarGraphItem(x=[], height=[], width=0.001, brush='b')
         self.stats_plot.addItem(self.stats_bar)
+        # Filled step curve: fallback if BarGraphItem does not paint on some pyqtgraph builds.
+        self.stats_step_curve = pg.PlotDataItem(
+            pen=None,
+            brush=pg.mkBrush(30, 30, 255, 160),
+            fillLevel=0,
+            stepMode='center',
+        )
+        self.stats_plot.addItem(self.stats_step_curve)
+        self.stats_step_curve.setVisible(False)
         self.stats_label = QLabel('μ=--  σ=--')
         btn_row = QHBoxLayout()
         self.btn_stats = QPushButton('Acquire Stats')
@@ -245,14 +348,7 @@ class RPLockboxTab(DeviceTab):
     def _connect_panel_signals(self, p):
         ch = p.ch
 
-        p.setpoint_edit.returnPressed.connect(lambda c=ch: self._set_param(c, 'setpoint'))
-        p.p_edit.returnPressed.connect(lambda c=ch: self._set_param(c, 'p'))
-        p.i_edit.returnPressed.connect(lambda c=ch: self._set_param(c, 'i'))
-        p.ival_edit.returnPressed.connect(lambda c=ch: self._set_param(c, 'ival'))
-        p.min_v_edit.returnPressed.connect(lambda c=ch: self._set_param(c, 'min_voltage'))
-        p.max_v_edit.returnPressed.connect(lambda c=ch: self._set_param(c, 'max_voltage'))
-        p.pause_gains_combo.currentTextChanged.connect(lambda v, c=ch: self._set_pause_gains(c, v))
-
+        p.btn_apply_pid.clicked.connect(lambda _, c=ch: self._apply_pid_params(c))
         p.btn_enable.clicked.connect(lambda _, c=ch: self._enable_pid(c))
         p.btn_disable.clicked.connect(lambda _, c=ch: self._disable_pid(c))
         p.btn_reset.clicked.connect(lambda _, c=ch: self._reset_pid(c))
@@ -271,7 +367,7 @@ class RPLockboxTab(DeviceTab):
 
     # ── Timer-driven trace refresh ───────────────────────────────────
 
-    @define_state(MODE_MANUAL, True)
+    @define_state(_ALL_DEVICE_MODES, True, True)
     def _on_refresh_tick(self):
         active_ch = self.ch_tabs.currentIndex()
         panel = self.panels[active_ch]
@@ -281,13 +377,31 @@ class RPLockboxTab(DeviceTab):
             panel.trace_input_curve.setData(t, result['input'])
             panel.trace_output_curve.setData(t, result['output'])
             panel.trace_setpoint_line.setValue(result['setpoint'])
+            panel.trace_setpoint_line.setVisible(panel.trace_show_setpoint_check.isChecked())
 
     # ── PID parameter methods ────────────────────────────────────────
 
-    @define_state(MODE_MANUAL, True)
-    def _set_param(self, channel, name):
-        panel = self.panels[channel]
-        edit_map = {
+    @staticmethod
+    def _parse_pid_panel_params(panel):
+        """Build params dict for apply_pid_params, or None if invalid."""
+        try:
+            return {
+                'min_voltage': float(panel.min_v_edit.text()),
+                'max_voltage': float(panel.max_v_edit.text()),
+                'setpoint': float(panel.setpoint_edit.text()),
+                'p': float(panel.p_edit.text()),
+                'i': float(panel.i_edit.text()),
+                'ival': float(panel.ival_edit.text()),
+                'pause_gains': panel.pause_gains_combo.currentText(),
+            }
+        except ValueError:
+            return None
+
+    def _apply_readbacks_to_pid_edits(self, panel, readbacks):
+        """Update line edits / combo from worker apply_pid_params return dict."""
+        if not readbacks:
+            return
+        key_to_edit = {
             'setpoint': panel.setpoint_edit,
             'p': panel.p_edit,
             'i': panel.i_edit,
@@ -295,36 +409,20 @@ class RPLockboxTab(DeviceTab):
             'min_voltage': panel.min_v_edit,
             'max_voltage': panel.max_v_edit,
         }
-        try:
-            val = float(edit_map[name].text())
-        except ValueError:
-            return
-        result = yield self.queue_work(self.primary_worker, 'set_pid_param', channel, name, val)
-        if isinstance(result, (int, float)):
-            edit_map[name].setText(f'{result:.6g}')
+        for key, edit in key_to_edit.items():
+            if key not in readbacks:
+                continue
+            val = readbacks[key]
+            if isinstance(val, (int, float)):
+                edit.setText(f'{val:.6g}')
+        if 'pause_gains' in readbacks:
+            pg = readbacks['pause_gains']
+            panel.pause_gains_combo.blockSignals(True)
+            panel.pause_gains_combo.setCurrentText(str(pg))
+            panel.pause_gains_combo.blockSignals(False)
 
-    @define_state(MODE_MANUAL, True)
-    def _set_pause_gains(self, channel, value):
-        yield self.queue_work(self.primary_worker, 'set_pid_param', channel, 'pause_gains', value)
-
-    @define_state(MODE_MANUAL, True)
-    def _enable_pid(self, channel):
-        yield self.queue_work(self.primary_worker, 'enable_pid', channel)
-
-    @define_state(MODE_MANUAL, True)
-    def _disable_pid(self, channel):
-        yield self.queue_work(self.primary_worker, 'disable_pid', channel)
-
-    @define_state(MODE_MANUAL, True)
-    def _reset_pid(self, channel):
-        yield self.queue_work(self.primary_worker, 'reset_pid', channel)
-        self._refresh_status(channel)
-
-    @define_state(MODE_MANUAL, True)
-    def _refresh_status(self, channel):
-        result = yield self.queue_work(self.primary_worker, 'get_pid_status', channel)
-        if not isinstance(result, dict):
-            return
+    def _apply_status_dict_to_panel(self, channel, result):
+        """Update channel panel widgets from get_pid_status dict."""
         p = self.panels[channel]
         p.setpoint_edit.setText(f"{result.get('setpoint', 0):.6g}")
         p.p_edit.setText(f"{result.get('p', 0):.6g}")
@@ -347,6 +445,74 @@ class RPLockboxTab(DeviceTab):
             p.seq_wrap_label.setStyleSheet('color: green; font-weight: bold;')
         else:
             p.seq_wrap_label.setStyleSheet('')
+
+    @define_state(MODE_MANUAL, True)
+    def _apply_pid_params(self, channel):
+        panel = self.panels[channel]
+        params = self._parse_pid_panel_params(panel)
+        if params is None:
+            return
+        if params['min_voltage'] >= params['max_voltage']:
+            return
+        result = yield self.queue_work(
+            self.primary_worker, 'apply_pid_params', channel, params,
+        )
+        if isinstance(result, dict):
+            self._apply_readbacks_to_pid_edits(panel, result)
+
+    @define_state(MODE_MANUAL, True)
+    def _enable_pid(self, channel):
+        panel = self.panels[channel]
+        params = self._parse_pid_panel_params(panel)
+        if params is None:
+            return
+        if params['min_voltage'] >= params['max_voltage']:
+            return
+        result = yield self.queue_work(
+            self.primary_worker, 'apply_pid_params', channel, params,
+        )
+        if isinstance(result, dict):
+            self._apply_readbacks_to_pid_edits(panel, result)
+        en = yield self.queue_work(self.primary_worker, 'enable_pid', channel)
+        if isinstance(en, dict):
+            cos = en.get('current_output_signal')
+            cos_s = 'n/a' if cos is None else f'{cos:.6g}'
+            msg = (
+                'enable_pid ch%d: p=%.6g i=%.6g setpoint=%.6g ival=%.6g paused=%s '
+                'output_direct=%r pause_gains=%r current_output_signal=%s'
+            ) % (
+                channel,
+                en.get('p', float('nan')),
+                en.get('i', float('nan')),
+                en.get('setpoint', float('nan')),
+                en.get('ival', float('nan')),
+                en.get('paused'),
+                en.get('output_direct'),
+                en.get('pause_gains'),
+                cos_s,
+            )
+            try:
+                self.logger.info(msg)
+            except AttributeError:
+                LOG.info(msg)
+
+    @define_state(MODE_MANUAL, True)
+    def _disable_pid(self, channel):
+        yield self.queue_work(self.primary_worker, 'disable_pid', channel)
+
+    @define_state(MODE_MANUAL, True)
+    def _reset_pid(self, channel):
+        yield self.queue_work(self.primary_worker, 'reset_pid', channel)
+        result = yield self.queue_work(self.primary_worker, 'get_pid_status', channel)
+        if isinstance(result, dict):
+            self._apply_status_dict_to_panel(channel, result)
+
+    @define_state(MODE_MANUAL, True)
+    def _refresh_status(self, channel):
+        result = yield self.queue_work(self.primary_worker, 'get_pid_status', channel)
+        if not isinstance(result, dict):
+            return
+        self._apply_status_dict_to_panel(channel, result)
 
     # ── Setpoint sequence ────────────────────────────────────────────
 
@@ -427,31 +593,123 @@ class RPLockboxTab(DeviceTab):
 
     # ── PSD / Stats ──────────────────────────────────────────────────
 
-    @define_state(MODE_MANUAL, True)
+    @define_state(_ALL_DEVICE_MODES, True)
     def _acquire_psd(self, channel):
         result = yield self.queue_work(self.primary_worker, 'compute_psd', channel)
+        p = self.panels[channel]
         if not isinstance(result, dict):
+            p.psd_curve.setData([], [])
+            p.psd_rms_label.setText(
+                'PSD failed: worker error (see BLACS worker log / tab error)',
+            )
+            return
+        err = result.get('error')
+        if err:
+            p.psd_curve.setData([], [])
+            short = str(err) if len(str(err)) <= 100 else str(err)[:97] + '...'
+            p.psd_rms_label.setText(f'PSD failed: {short}')
             return
         freqs = result.get('freqs', [])
         psd = result.get('psd', [])
         rms = result.get('rms', 0)
-        p = self.panels[channel]
         if freqs and psd:
-            p.psd_curve.setData(freqs, psd)
-        p.psd_rms_label.setText(f'RMS: {rms:.4g} V')
+            fx = np.asarray(freqs, dtype=np.float64)
+            py = np.asarray(psd, dtype=np.float64)
+            p.psd_curve.setData(fx, py)
+            p.psd_rms_label.setText(f'RMS: {rms:.4g} V')
+            _apply_psd_plot_ranges(p.psd_plot, fx, py)
+            try:
+                self.logger.debug(
+                    'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
+                    channel, len(fx), float(np.min(fx)), float(np.max(fx)),
+                )
+            except AttributeError:
+                LOG.debug(
+                    'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
+                    channel, len(fx), float(np.min(fx)), float(np.max(fx)),
+                )
+        else:
+            p.psd_curve.setData([], [])
+            p.psd_rms_label.setText('PSD: no data (check input / worker log)')
 
-    @define_state(MODE_MANUAL, True)
+    @define_state(_ALL_DEVICE_MODES, True)
     def _acquire_stats(self, channel):
         result = yield self.queue_work(self.primary_worker, 'get_stats', channel)
-        if not isinstance(result, dict):
-            return
         p = self.panels[channel]
+
+        def _clear_stats_plot():
+            p.stats_bar.setOpts(x=[], height=[], width=0.001)
+            p.stats_bar.setVisible(True)
+            p.stats_step_curve.setData([])
+            p.stats_step_curve.setVisible(False)
+
+        if not isinstance(result, dict):
+            _clear_stats_plot()
+            p.stats_label.setText(
+                'Stats failed: worker error (see BLACS worker log / tab error)',
+            )
+            return
+        err = result.get('error')
+        if err:
+            _clear_stats_plot()
+            short = str(err) if len(str(err)) <= 100 else str(err)[:97] + '...'
+            p.stats_label.setText(f'Stats failed: {short}')
+            return
         counts = result.get('hist_counts', [])
         edges = result.get('hist_edges', [])
         mean = result.get('mean', 0)
         std = result.get('std', 0)
-        if counts and edges:
-            centers = [(edges[i] + edges[i + 1]) / 2 for i in range(len(counts))]
-            width = edges[1] - edges[0] if len(edges) > 1 else 0.001
-            p.stats_bar.setOpts(x=centers, height=counts, width=width * 0.9)
+        if not (counts and edges and len(edges) == len(counts) + 1):
+            _clear_stats_plot()
+            p.stats_label.setText('Stats: no histogram data (check input / worker log)')
+            return
+
+        counts_arr = np.asarray(counts, dtype=np.float64)
+        edges_arr = np.asarray(edges, dtype=np.float64)
+        centers_arr = (edges_arr[:-1] + edges_arr[1:]) * 0.5
+        width = float(edges_arr[1] - edges_arr[0]) if edges_arr.size > 1 else 0.0
+        bar_ok = (
+            width > 0
+            and math.isfinite(width)
+            and centers_arr.size == counts_arr.size
+            and centers_arr.size > 0
+        )
+
+        if bar_ok:
+            p.stats_bar.setOpts(
+                x=centers_arr,
+                height=counts_arr,
+                width=width * 0.9,
+            )
+            p.stats_bar.setVisible(True)
+            p.stats_step_curve.setData([])
+            p.stats_step_curve.setVisible(False)
+        else:
+            p.stats_bar.setOpts(x=[], height=[], width=0.001)
+            p.stats_bar.setVisible(False)
+            p.stats_step_curve.setData(
+                centers_arr,
+                counts_arr,
+                stepMode='center',
+                fillLevel=0,
+                brush=pg.mkBrush(30, 30, 255, 160),
+                pen=None,
+            )
+            p.stats_step_curve.setVisible(True)
+
+        span = float(edges_arr[-1] - edges_arr[0])
+        x_pad = max(span * 0.02, 1e-9)
+        y_max = max(float(np.max(counts_arr)), 1.0) * 1.15
+        p.stats_plot.setXRange(float(edges_arr[0]) - x_pad, float(edges_arr[-1]) + x_pad, padding=0)
+        p.stats_plot.setYRange(0.0, y_max, padding=0)
         p.stats_label.setText(f'μ={mean:.4g}  σ={std:.4g}')
+        try:
+            self.logger.debug(
+                'Stats ch%d: bins=%d bar_ok=%r sum_counts=%.4g',
+                channel, len(counts_arr), bar_ok, float(np.sum(counts_arr)),
+            )
+        except AttributeError:
+            LOG.debug(
+                'Stats ch%d: bins=%d bar_ok=%r sum_counts=%.4g',
+                channel, len(counts_arr), bar_ok, float(np.sum(counts_arr)),
+            )

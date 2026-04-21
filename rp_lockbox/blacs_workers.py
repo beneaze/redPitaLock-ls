@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import logging
-import threading
 from collections import deque
 
 os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
@@ -24,86 +23,76 @@ LOG = logging.getLogger(__name__)
 ASG_MIN_FREQ_HZ = 0.1
 ASG_DC_FREQ_PLACEHOLDER_HZ = 1e3
 
+# Default decimation for live monitoring scope grabs.  Low decimation = fast
+# acquisition but short time window.  64 -> 16384*64/125e6 ~ 8 ms per trace.
+MONITOR_DECIMATION = 64
 
-def _extract_scope_trace(raw, channel):
-    """Normalize scope.single() return to a 1D float array for ADC channel 0 or 1."""
-    ch = int(channel)
-    if isinstance(raw, (list, tuple)) and len(raw) > ch:
-        return np.asarray(raw[ch], dtype=np.float64).ravel()
-    arr = np.asarray(raw, dtype=np.float64)
-    if arr.ndim == 2 and arr.shape[0] > ch:
-        return np.asarray(arr[ch], dtype=np.float64).ravel()
-    if arr.ndim == 1 and arr.size > 0:
-        return arr.ravel()
-    return np.asarray([], dtype=np.float64)
+# Ring buffer length for the voltage-vs-time display (one entry per scope grab).
+TRACE_BUFLEN = 600
 
 
-class AccumulatorThread(threading.Thread):
-    """Background thread that polls scope voltages at ~100 Hz into ring buffers."""
+def _read_scope_raw(scope, decimation):
+    """Trigger the scope and read both channel buffers directly.
 
-    RATE_HZ = 100
-    BUFLEN = 2000  # ~20 s of data
+    Bypasses scope.single() (which hangs on the wwlyn FPGA bitfile because
+    curve_ready() never becomes True).  Instead we poke the FPGA trigger
+    registers, wait for the acquisition to finish, then bulk-read the data
+    buffers.
 
-    def __init__(self, rp, stop_event):
-        super().__init__(daemon=True, name='rp-accumulator')
-        self.rp = rp
-        self.stop = stop_event
-        self.lock = threading.Lock()
-        self.t0 = None
-        self.bufs = {
-            'time': deque(maxlen=self.BUFLEN),
-            'in1': deque(maxlen=self.BUFLEN),
-            'in2': deque(maxlen=self.BUFLEN),
-            'out1': deque(maxlen=self.BUFLEN),
-            'out2': deque(maxlen=self.BUFLEN),
-        }
+    Returns (ch1_volts, ch2_volts) as 1-D float64 arrays of length
+    scope.data_length.
+    """
+    scope.decimation = decimation
+    scope.average = False
 
-    def run(self):
-        self.t0 = time.monotonic()
-        interval = 1.0 / self.RATE_HZ
-        while not self.stop.is_set():
-            t = time.monotonic() - self.t0
-            try:
-                sc = self.rp.scope
-                v_in1 = float(sc.voltage_in1)
-                v_in2 = float(sc.voltage_in2)
-                v_out1 = float(sc.voltage_out1)
-                v_out2 = float(sc.voltage_out2)
-                with self.lock:
-                    self.bufs['time'].append(t)
-                    self.bufs['in1'].append(v_in1)
-                    self.bufs['in2'].append(v_in2)
-                    self.bufs['out1'].append(v_out1)
-                    self.bufs['out2'].append(v_out2)
-            except Exception:
-                pass
-            self.stop.wait(interval)
+    scope._reset_writestate_machine = True
+    scope._trigger_delay_register = scope.data_length
+    scope._trigger_armed = True
+    scope._trigger_source_register = 'immediately'
 
-    def get_snapshot(self, channel):
-        """Return (times, input_v, output_v) lists for one channel (0 or 1)."""
-        in_key = f'in{channel + 1}'
-        out_key = f'out{channel + 1}'
-        with self.lock:
-            return (
-                list(self.bufs['time']),
-                list(self.bufs[in_key]),
-                list(self.bufs[out_key]),
-            )
+    # Wait for the acquisition to fill the buffer.
+    acq_time = scope.data_length * decimation / 125e6
+    time.sleep(max(0.005, acq_time * 1.2))
+
+    n = scope.data_length
+
+    raw1 = np.array(scope._reads(0x10000, n), dtype=np.int16)
+    raw1[raw1 >= 2 ** 13] -= 2 ** 14
+    ch1 = raw1.astype(np.float64) / 2 ** 13
+
+    raw2 = np.array(scope._reads(0x20000, n), dtype=np.int16)
+    raw2[raw2 >= 2 ** 13] -= 2 ** 14
+    ch2 = raw2.astype(np.float64) / 2 ** 13
+
+    return ch1, ch2
 
 
 class RPLockboxWorker(Worker):
 
     def init(self):
-        from qtutils.qt.QtCore import QCoreApplication
+        try:
+            from qtutils.qt.QtCore import QCoreApplication
+            if QCoreApplication.instance() is None:
+                QCoreApplication(sys.argv)
+        except Exception:
+            LOG.debug('QCoreApplication bootstrap skipped', exc_info=True)
+
         from pyrpl import Pyrpl
 
-        # PyRPL scope.single() uses QEventLoop; BLACS worker runs in a subprocess
-        # without a default Qt core application unless we create one here.
-        if QCoreApplication.instance() is None:
-            QCoreApplication(sys.argv)
-
-        self.p = Pyrpl(config='rp_lockbox', hostname=self.ip_addr, gui=False)
+        # reloadserver=True in rp_lockbox.yml makes PyRPL scp pyrpl_server over the
+        # running binary on every connect ("Text file busy"), which breaks the
+        # socket server and makes PID/BLACS flaky.  Override here.
+        self.p = Pyrpl(
+            config='rp_lockbox',
+            hostname=self.ip_addr,
+            gui=False,
+            reloadserver=False,
+        )
         self.rp = self.p.rp
+
+        sc = self.rp.scope
+        sc.input1 = 'in1'
+        sc.input2 = 'in2'
 
         self.pids = [self.rp.pid0, self.rp.pid1]
         self.asgs = [self.rp.asg0, self.rp.asg1]
@@ -112,11 +101,13 @@ class RPLockboxWorker(Worker):
 
         for i, pid in enumerate(self.pids):
             pid.input = self.inputs[i]
-            pid.output_direct = self.outputs[i]
+            pid.output_direct = 'off'
             pid.p = 0
             pid.i = 0
             pid.ival = 0
             pid.setpoint = 0
+            pid.min_voltage = -1.0
+            pid.max_voltage = 1.0
             pid.pause_gains = 'pi'
             pid.paused = True
             try:
@@ -124,22 +115,80 @@ class RPLockboxWorker(Worker):
             except AttributeError:
                 pass
 
+        # PyRPL autosaves every property change to rp_lockbox.yml and can reload
+        # state in ways that fight BLACS-driven register writes. Disable autosave
+        # on hardware modules we own from this worker.
+        for pid in self.pids:
+            try:
+                pid._autosave_active = False
+            except AttributeError:
+                pass
+        for asg in self.asgs:
+            try:
+                asg._autosave_active = False
+            except AttributeError:
+                pass
+
         self._asg_active = [False, False]
 
-        self._stop_event = threading.Event()
-        self._accumulator = AccumulatorThread(self.rp, self._stop_event)
-        self._accumulator.start()
+        self._trace_bufs = {
+            'time': deque(maxlen=TRACE_BUFLEN),
+            'in1': deque(maxlen=TRACE_BUFLEN),
+            'in2': deque(maxlen=TRACE_BUFLEN),
+            'out1': deque(maxlen=TRACE_BUFLEN),
+            'out2': deque(maxlen=TRACE_BUFLEN),
+        }
+        self._t0 = time.monotonic()
+
+        try:
+            ch1, ch2 = _read_scope_raw(sc, MONITOR_DECIMATION)
+            LOG.info(
+                'Startup ADC check: ch1 mean=%.4f V, ch2 mean=%.4f V',
+                ch1.mean(), ch2.mean(),
+            )
+        except Exception:
+            LOG.exception('Startup ADC check failed')
 
     # ── Voltage monitoring ───────────────────────────────────────────
 
     def get_trace_data(self, channel):
-        """Return accumulated voltage traces for a channel."""
-        times, inp, out = self._accumulator.get_snapshot(channel)
+        """Acquire a scope trace and append mean voltages to the ring buffer.
+
+        Called by the tab's 100 ms refresh timer.  Each call triggers two
+        scope acquisitions (inputs then DAC outputs) so the output trace
+        reflects real BNC voltage, not pid.ival.
+        """
+        try:
+            sc = self.rp.scope
+            saved_in1 = sc.input1
+            saved_in2 = sc.input2
+            try:
+                sc.input1 = 'in1'
+                sc.input2 = 'in2'
+                ch1, ch2 = _read_scope_raw(sc, MONITOR_DECIMATION)
+                sc.input1 = 'out1'
+                sc.input2 = 'out2'
+                out1, out2 = _read_scope_raw(sc, MONITOR_DECIMATION)
+            finally:
+                sc.input1 = saved_in1
+                sc.input2 = saved_in2
+
+            t = time.monotonic() - self._t0
+            self._trace_bufs['time'].append(t)
+            self._trace_bufs['in1'].append(float(ch1.mean()))
+            self._trace_bufs['in2'].append(float(ch2.mean()))
+            self._trace_bufs['out1'].append(float(out1.mean()))
+            self._trace_bufs['out2'].append(float(out2.mean()))
+        except Exception:
+            LOG.exception('get_trace_data acquisition failed')
+
+        in_key = f'in{channel + 1}'
+        out_key = f'out{channel + 1}'
         pid = self.pids[channel]
         return {
-            'times': times,
-            'input': inp,
-            'output': out,
+            'times': list(self._trace_bufs['time']),
+            'input': list(self._trace_bufs[in_key]),
+            'output': list(self._trace_bufs[out_key]),
             'setpoint': float(pid.setpoint),
         }
 
@@ -201,17 +250,68 @@ class RPLockboxWorker(Worker):
         else:
             raise ValueError(f'Unknown parameter: {name}')
 
+    def apply_pid_params(self, channel, params):
+        """Apply several PID fields in one worker job (single BLACS queue round-trip).
+
+        params: dict with keys among min_voltage, max_voltage, setpoint, p, i, ival,
+        pause_gains. Application order is fixed for sensible FPGA updates.
+        """
+        order = (
+            'min_voltage', 'max_voltage', 'setpoint', 'p', 'i', 'ival', 'pause_gains',
+        )
+        readbacks = {}
+        for key in order:
+            if key not in params:
+                continue
+            readbacks[key] = self.set_pid_param(channel, key, params[key])
+        return readbacks
+
     def enable_pid(self, channel):
         pid = self.pids[channel]
         if self._asg_active[channel]:
             self.stop_asg_output(channel)
+
+        p_val = float(pid.p)
+        i_val = float(pid.i)
+        sp_val = float(pid.setpoint)
+        iv_val = float(pid.ival)
+
         pid.output_direct = self.outputs[channel]
         pid.paused = False
-        return not pid.paused
+
+        # Some bitfiles may ignore P/I writes while paused; re-assert after unpausing.
+        pid.p = p_val
+        pid.i = i_val
+        pid.setpoint = sp_val
+        pid.ival = iv_val
+
+        if bool(pid.paused):
+            LOG.error(
+                'enable_pid ch%d: paused still True after unpause (output_direct=%r)',
+                channel,
+                pid.output_direct,
+            )
+
+        diag = {
+            'channel': int(channel),
+            'p': float(pid.p),
+            'i': float(pid.i),
+            'setpoint': float(pid.setpoint),
+            'ival': float(pid.ival),
+            'paused': bool(pid.paused),
+            'output_direct': str(pid.output_direct),
+            'pause_gains': str(pid.pause_gains),
+        }
+        try:
+            diag['current_output_signal'] = float(pid.current_output_signal)
+        except AttributeError:
+            diag['current_output_signal'] = None
+        return diag
 
     def disable_pid(self, channel):
         pid = self.pids[channel]
         pid.paused = True
+        pid.output_direct = 'off'
         return pid.paused
 
     def reset_pid(self, channel):
@@ -221,6 +321,7 @@ class RPLockboxWorker(Worker):
         pid.ival = 0
         pid.setpoint = 0
         pid.paused = True
+        pid.output_direct = 'off'
         return True
 
     # ── Setpoint sequence (wwlyn extensions) ─────────────────────────
@@ -261,48 +362,106 @@ class RPLockboxWorker(Worker):
 
     # ── PSD and statistics ───────────────────────────────────────────
 
-    def compute_psd(self, channel, decimation=64):
-        """Acquire scope burst and compute Welch PSD."""
-        from scipy.signal import welch
+    def compute_psd(self, channel, decimation=1):
+        """Acquire scope burst and compute Welch PSD.
+
+        Default ``decimation=1`` uses the full 125 MS/s scope rate so the PSD
+        reaches ~62.5 MHz (Nyquist). Higher decimation lowers the band limit.
+
+        Returned ``psd`` values are clamped to be strictly positive so the
+        BLACS log–log plot can render (Welch bins are often exactly zero).
+        """
+        try:
+            from scipy.signal import welch
+        except ImportError as e:
+            LOG.error('compute_psd: scipy required (%s)', e)
+            return {
+                'freqs': [], 'psd': [], 'rms': 0.0,
+                'error': 'scipy is not installed (need scipy.signal.welch)',
+            }
 
         try:
             scope = self.rp.scope
-            scope.trace_average = 1
-            scope.input1 = self.inputs[channel]
-            scope.decimation = decimation
-            scope.trigger_source = 'immediately'
-            fs = 125e6 / decimation
+            saved_in1 = scope.input1
+            saved_in2 = scope.input2
+            try:
+                scope.input1 = self.inputs[channel]
+                scope.input2 = self.inputs[channel]
+                ch1, _ch2 = _read_scope_raw(scope, decimation)
+            finally:
+                scope.input1 = saved_in1
+                scope.input2 = saved_in2
 
-            raw = scope.single()
-            trace = _extract_scope_trace(raw, channel)
+            trace = ch1
             if trace.size == 0:
-                return {'freqs': [], 'psd': [], 'rms': 0.0}
+                LOG.warning('compute_psd: empty trace (channel=%s)', channel)
+                return {
+                    'freqs': [], 'psd': [], 'rms': 0.0,
+                    'error': 'empty scope trace',
+                }
 
+            fs = 125e6 / decimation
             nperseg = min(1024, trace.size)
             freqs, psd_vals = welch(trace, fs=fs, nperseg=nperseg)
             rms = float(np.sqrt(np.trapz(psd_vals, freqs)))
+            # Drop the DC bin (freq=0) so the log-scale plot doesn't choke
+            # on log10(0) = -inf.
+            freqs = freqs[1:]
+            psd_vals = psd_vals[1:].astype(np.float64, copy=False)
+            if freqs.size == 0 or psd_vals.size == 0:
+                return {
+                    'freqs': [], 'psd': [], 'rms': float(rms),
+                    'error': 'PSD spectrum empty after DC removal',
+                }
+            # Log y cannot plot zeros or negatives; clamp for display only.
+            mx = float(np.nanmax(psd_vals))
+            if not np.isfinite(mx) or mx <= 0:
+                floor = 1e-30
+            else:
+                floor = max(1e-30, mx * 1e-15)
+            psd_plot = np.maximum(psd_vals, floor)
+            freqs_plot = np.asarray(freqs, dtype=np.float64)
+            mask = freqs_plot > 0
+            if not np.all(mask):
+                freqs_plot = freqs_plot[mask]
+                psd_plot = psd_plot[mask]
+            psd_plot = np.nan_to_num(psd_plot, nan=floor, posinf=floor, neginf=floor)
             return {
-                'freqs': freqs.tolist(),
-                'psd': psd_vals.tolist(),
+                'freqs': freqs_plot.tolist(),
+                'psd': psd_plot.tolist(),
                 'rms': rms,
             }
-        except Exception:
+        except Exception as e:
             LOG.exception('compute_psd failed (channel=%s)', channel)
-            return {'freqs': [], 'psd': [], 'rms': 0.0}
+            msg = str(e).replace('\n', ' ')
+            if len(msg) > 240:
+                msg = msg[:237] + '...'
+            return {'freqs': [], 'psd': [], 'rms': 0.0, 'error': msg}
 
     def get_stats(self, channel, decimation=64):
         """Acquire scope burst and return histogram statistics."""
         try:
             scope = self.rp.scope
-            scope.trace_average = 1
-            scope.input1 = self.inputs[channel]
-            scope.decimation = decimation
-            scope.trigger_source = 'immediately'
+            saved_in1 = scope.input1
+            saved_in2 = scope.input2
+            try:
+                scope.input1 = self.inputs[channel]
+                scope.input2 = self.inputs[channel]
+                ch1, _ch2 = _read_scope_raw(scope, decimation)
+            finally:
+                scope.input1 = saved_in1
+                scope.input2 = saved_in2
 
-            raw = scope.single()
-            trace = _extract_scope_trace(raw, channel)
+            trace = ch1
             if trace.size == 0:
-                return {'mean': 0.0, 'std': 0.0, 'hist_counts': [], 'hist_edges': []}
+                LOG.warning('get_stats: empty trace (channel=%s)', channel)
+                return {
+                    'mean': 0.0,
+                    'std': 0.0,
+                    'hist_counts': [],
+                    'hist_edges': [],
+                    'error': 'empty scope trace',
+                }
 
             mean = float(np.mean(trace))
             std = float(np.std(trace))
@@ -313,9 +472,18 @@ class RPLockboxWorker(Worker):
                 'hist_counts': counts.tolist(),
                 'hist_edges': edges.tolist(),
             }
-        except Exception:
+        except Exception as e:
             LOG.exception('get_stats failed (channel=%s)', channel)
-            return {'mean': 0.0, 'std': 0.0, 'hist_counts': [], 'hist_edges': []}
+            msg = str(e).replace('\n', ' ')
+            if len(msg) > 240:
+                msg = msg[:237] + '...'
+            return {
+                'mean': 0.0,
+                'std': 0.0,
+                'hist_counts': [],
+                'hist_edges': [],
+                'error': msg,
+            }
 
     # ── ASG waveform output ──────────────────────────────────────────
 
@@ -334,7 +502,6 @@ class RPLockboxWorker(Worker):
         freq = float(frequency)
 
         if wf == 'dc':
-            # DC table is zeros; use non-zero dummy frequency and non-zero amplitude scale.
             freq_hz = ASG_DC_FREQ_PLACEHOLDER_HZ
             amp_v = 1.0
         else:
@@ -349,11 +516,9 @@ class RPLockboxWorker(Worker):
             trigger_source='immediately',
             output_direct=self.outputs[channel],
         )
-        # Re-arm trigger like PyRPL's Asg.trig() (immediately then off).
         if hasattr(asg, 'trig'):
             asg.trig()
         if wf != 'dc':
-            # Continuous repeating output for ramp/square/sine.
             asg.periodic = True
 
         self._asg_active[channel] = True
@@ -424,17 +589,17 @@ class RPLockboxWorker(Worker):
         for pid in self.pids:
             pid.pause_gains = 'pi'
             pid.paused = True
+            pid.output_direct = 'off'
         return True
 
     def abort_transition_to_buffered(self):
         return self.abort_buffered()
 
     def shutdown(self):
-        self._stop_event.set()
-        self._accumulator.join(timeout=2.0)
         for pid in self.pids:
             pid.pause_gains = 'pi'
             pid.paused = True
+            pid.output_direct = 'off'
         for asg in self.asgs:
             asg.output_direct = 'off'
             asg.amplitude = 0

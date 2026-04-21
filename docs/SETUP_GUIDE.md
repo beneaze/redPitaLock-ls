@@ -103,6 +103,18 @@ Add an empty **`user_devices/__init__.py`** under `userlib\user_devices` if it d
 
 Labscript adds `...\labscript-suite\userlib` to `sys.path`, so `user_devices` imports resolve correctly.
 
+### 4. Confirm BLACS loads your `rp_lockbox` sources
+
+After editing `blacs_tabs.py` or `blacs_workers.py`, **restart BLACS** so the main process and the **hardware worker** subprocess both reload.
+
+Check that Python resolves `user_devices.rp_lockbox` to the tree you maintain (junction from §2, or a copy you update). In the **same conda env** you use to start BLACS (for example `labscript-rp`):
+
+```text
+python -c "import user_devices.rp_lockbox.blacs_tabs as t; print(t.__file__)"
+```
+
+If that path is not your checkout, changes in a different clone (for example `redPitaLock-ls` on disk) will not affect BLACS until you refresh `userlib\user_devices\rp_lockbox` or the junction target.
+
 ---
 
 ## Device registration (`register_classes.py`) — critical detail
@@ -245,9 +257,9 @@ The hardware worker runs in a **separate process**. PyRPL’s `scope.single()` c
 
 **Implemented in `rp_lockbox/blacs_workers.py`:** at the start of `RPLockboxWorker.init()`, if `QCoreApplication.instance()` is `None`, create `QCoreApplication(sys.argv)` before constructing `Pyrpl(...)`.
 
-**Live voltage traces** use **`rp.scope.voltage_in1` / `voltage_in2`** and **`voltage_out1` / `voltage_out2`** (calibrated scope registers), not `rp.sampler.*`, so the monitor matches what you expect at the BNCs.
+**Live voltage traces** in `RPLockboxWorker.get_trace_data`: two back-to-back raw scope acquisitions per refresh — first **`in1` / `in2`** (input means), then **`out1` / `out2`** (DAC / BNC means). PyRPL autosave on PID/ASG modules is disabled in the worker init so BLACS register writes are not overwritten from `rp_lockbox.yml`. On **Enable PID**, the worker logs FPGA readbacks including **`current_output_signal`** when available.
 
-**Scope traces for PSD / stats** are parsed defensively: `scope.single()` may return a **tuple** `(ch1, ch2)`, a **2×N** array, or a single 1D trace. The worker selects the row for the requested channel. `scope.trace_average = 1` is set before each shot for a fast single acquisition.
+**Scope traces for PSD / stats** use the same **`_read_scope_raw`** path as the rest of the worker: the FPGA trigger is armed for an immediate acquisition, the code waits for the buffer fill time, then bulk-reads the scope RAM into **1-D float arrays** (volts). This bypasses **`scope.single()`**, which can hang on some bitfiles when **`curve_ready()`** never asserts.
 
 **Manual ASG (DC, triangle, square, sine):**
 
