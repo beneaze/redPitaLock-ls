@@ -23,6 +23,9 @@ _ALL_DEVICE_MODES = (
     | MODE_TRANSITION_TO_MANUAL
 )
 
+# Auto-refresh interval for PSD + histogram (active channel). Lower = more RP/worker load.
+PSD_STATS_REFRESH_MS = 200
+
 from qtutils.qt.QtCore import QTimer
 from qtutils.qt.QtWidgets import (
     QWidget, QTabWidget, QGridLayout, QVBoxLayout, QHBoxLayout,
@@ -334,6 +337,11 @@ class RPLockboxTab(DeviceTab):
         self._refresh_timer.timeout.connect(self._on_refresh_tick)
         self._refresh_timer.start()
 
+        self._psd_stats_timer = QTimer()
+        self._psd_stats_timer.setInterval(PSD_STATS_REFRESH_MS)
+        self._psd_stats_timer.timeout.connect(self._on_psd_stats_refresh_tick)
+        self._psd_stats_timer.start()
+
     def initialise_workers(self):
         conn = self.settings['connection_table']
         dev = conn.find_by_name(self.device_name)
@@ -378,6 +386,31 @@ class RPLockboxTab(DeviceTab):
             panel.trace_output_curve.setData(t, result['output'])
             panel.trace_setpoint_line.setValue(result['setpoint'])
             panel.trace_setpoint_line.setVisible(panel.trace_show_setpoint_check.isChecked())
+
+    @define_state(_ALL_DEVICE_MODES, True, True)
+    def _on_psd_stats_refresh_tick(self):
+        """Periodically update PSD and histogram for the currently visible channel."""
+        active_ch = self.ch_tabs.currentIndex()
+        psd_result = yield self.queue_work(self.primary_worker, 'compute_psd', active_ch)
+        self._apply_psd_worker_result(active_ch, psd_result)
+        stats_result = yield self.queue_work(self.primary_worker, 'get_stats', active_ch)
+        self._apply_stats_worker_result(active_ch, stats_result)
+
+    def _pause_timers_for_pid_ops(self):
+        """Stop trace + PSD/stats timers (contention avoidance for Apply/Reset/Refresh)."""
+        self._refresh_timer.stop()
+        self._psd_stats_timer.stop()
+
+    def _resume_timers_for_pid_ops(self):
+        self._refresh_timer.start()
+        self._psd_stats_timer.start()
+
+    def _pause_psd_stats_timer_for_pid_ops(self):
+        """Stop only PSD/stats timer so voltage traces keep updating during Enable/Disable."""
+        self._psd_stats_timer.stop()
+
+    def _resume_psd_stats_timer_for_pid_ops(self):
+        self._psd_stats_timer.start()
 
     # ── PID parameter methods ────────────────────────────────────────
 
@@ -448,71 +481,93 @@ class RPLockboxTab(DeviceTab):
 
     @define_state(MODE_MANUAL, True)
     def _apply_pid_params(self, channel):
-        panel = self.panels[channel]
-        params = self._parse_pid_panel_params(panel)
-        if params is None:
-            return
-        if params['min_voltage'] >= params['max_voltage']:
-            return
-        result = yield self.queue_work(
-            self.primary_worker, 'apply_pid_params', channel, params,
-        )
-        if isinstance(result, dict):
-            self._apply_readbacks_to_pid_edits(panel, result)
+        self._pause_timers_for_pid_ops()
+        try:
+            panel = self.panels[channel]
+            params = self._parse_pid_panel_params(panel)
+            if params is None:
+                return
+            if params['min_voltage'] >= params['max_voltage']:
+                return
+            result = yield self.queue_work(
+                self.primary_worker, 'apply_pid_params', channel, params,
+            )
+            if isinstance(result, dict):
+                self._apply_readbacks_to_pid_edits(panel, result)
+        finally:
+            self._resume_timers_for_pid_ops()
 
     @define_state(MODE_MANUAL, True)
     def _enable_pid(self, channel):
-        panel = self.panels[channel]
-        params = self._parse_pid_panel_params(panel)
-        if params is None:
-            return
-        if params['min_voltage'] >= params['max_voltage']:
-            return
-        result = yield self.queue_work(
-            self.primary_worker, 'apply_pid_params', channel, params,
-        )
-        if isinstance(result, dict):
-            self._apply_readbacks_to_pid_edits(panel, result)
-        en = yield self.queue_work(self.primary_worker, 'enable_pid', channel)
-        if isinstance(en, dict):
-            cos = en.get('current_output_signal')
-            cos_s = 'n/a' if cos is None else f'{cos:.6g}'
-            msg = (
-                'enable_pid ch%d: p=%.6g i=%.6g setpoint=%.6g ival=%.6g paused=%s '
-                'output_direct=%r pause_gains=%r current_output_signal=%s'
-            ) % (
-                channel,
-                en.get('p', float('nan')),
-                en.get('i', float('nan')),
-                en.get('setpoint', float('nan')),
-                en.get('ival', float('nan')),
-                en.get('paused'),
-                en.get('output_direct'),
-                en.get('pause_gains'),
-                cos_s,
+        self._pause_psd_stats_timer_for_pid_ops()
+        try:
+            panel = self.panels[channel]
+            params = self._parse_pid_panel_params(panel)
+            if params is None:
+                return
+            if params['min_voltage'] >= params['max_voltage']:
+                return
+            result = yield self.queue_work(
+                self.primary_worker, 'apply_params_and_enable_pid', channel, params,
             )
-            try:
-                self.logger.info(msg)
-            except AttributeError:
-                LOG.info(msg)
+            if isinstance(result, dict):
+                rb = result.get('readbacks')
+                if isinstance(rb, dict):
+                    self._apply_readbacks_to_pid_edits(panel, rb)
+                en = result.get('enable')
+                if isinstance(en, dict):
+                    cos = en.get('current_output_signal')
+                    cos_s = 'n/a' if cos is None else f'{cos:.6g}'
+                    msg = (
+                        'enable_pid ch%d: p=%.6g i=%.6g setpoint=%.6g ival=%.6g paused=%s '
+                        'output_direct=%r pause_gains=%r current_output_signal=%s'
+                    ) % (
+                        channel,
+                        en.get('p', float('nan')),
+                        en.get('i', float('nan')),
+                        en.get('setpoint', float('nan')),
+                        en.get('ival', float('nan')),
+                        en.get('paused'),
+                        en.get('output_direct'),
+                        en.get('pause_gains'),
+                        cos_s,
+                    )
+                    try:
+                        self.logger.info(msg)
+                    except AttributeError:
+                        LOG.info(msg)
+        finally:
+            self._resume_psd_stats_timer_for_pid_ops()
 
     @define_state(MODE_MANUAL, True)
     def _disable_pid(self, channel):
-        yield self.queue_work(self.primary_worker, 'disable_pid', channel)
+        self._pause_psd_stats_timer_for_pid_ops()
+        try:
+            yield self.queue_work(self.primary_worker, 'disable_pid', channel)
+        finally:
+            self._resume_psd_stats_timer_for_pid_ops()
 
     @define_state(MODE_MANUAL, True)
     def _reset_pid(self, channel):
-        yield self.queue_work(self.primary_worker, 'reset_pid', channel)
-        result = yield self.queue_work(self.primary_worker, 'get_pid_status', channel)
-        if isinstance(result, dict):
-            self._apply_status_dict_to_panel(channel, result)
+        self._pause_timers_for_pid_ops()
+        try:
+            yield self.queue_work(self.primary_worker, 'reset_pid', channel)
+            result = yield self.queue_work(self.primary_worker, 'get_pid_status', channel)
+            if isinstance(result, dict):
+                self._apply_status_dict_to_panel(channel, result)
+        finally:
+            self._resume_timers_for_pid_ops()
 
     @define_state(MODE_MANUAL, True)
     def _refresh_status(self, channel):
-        result = yield self.queue_work(self.primary_worker, 'get_pid_status', channel)
-        if not isinstance(result, dict):
-            return
-        self._apply_status_dict_to_panel(channel, result)
+        self._pause_timers_for_pid_ops()
+        try:
+            result = yield self.queue_work(self.primary_worker, 'get_pid_status', channel)
+            if not isinstance(result, dict):
+                return
+            self._apply_status_dict_to_panel(channel, result)
+        finally:
+            self._resume_timers_for_pid_ops()
 
     # ── Setpoint sequence ────────────────────────────────────────────
 
@@ -593,9 +648,8 @@ class RPLockboxTab(DeviceTab):
 
     # ── PSD / Stats ──────────────────────────────────────────────────
 
-    @define_state(_ALL_DEVICE_MODES, True)
-    def _acquire_psd(self, channel):
-        result = yield self.queue_work(self.primary_worker, 'compute_psd', channel)
+    def _apply_psd_worker_result(self, channel, result):
+        """Update PSD plot from ``compute_psd`` return dict."""
         p = self.panels[channel]
         if not isinstance(result, dict):
             p.psd_curve.setData([], [])
@@ -632,9 +686,8 @@ class RPLockboxTab(DeviceTab):
             p.psd_curve.setData([], [])
             p.psd_rms_label.setText('PSD: no data (check input / worker log)')
 
-    @define_state(_ALL_DEVICE_MODES, True)
-    def _acquire_stats(self, channel):
-        result = yield self.queue_work(self.primary_worker, 'get_stats', channel)
+    def _apply_stats_worker_result(self, channel, result):
+        """Update histogram from ``get_stats`` return dict."""
         p = self.panels[channel]
 
         def _clear_stats_plot():
@@ -713,3 +766,13 @@ class RPLockboxTab(DeviceTab):
                 'Stats ch%d: bins=%d bar_ok=%r sum_counts=%.4g',
                 channel, len(counts_arr), bar_ok, float(np.sum(counts_arr)),
             )
+
+    @define_state(_ALL_DEVICE_MODES, True)
+    def _acquire_psd(self, channel):
+        result = yield self.queue_work(self.primary_worker, 'compute_psd', channel)
+        self._apply_psd_worker_result(channel, result)
+
+    @define_state(_ALL_DEVICE_MODES, True)
+    def _acquire_stats(self, channel):
+        result = yield self.queue_work(self.primary_worker, 'get_stats', channel)
+        self._apply_stats_worker_result(channel, result)

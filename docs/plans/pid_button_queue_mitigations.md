@@ -33,7 +33,9 @@ Add `apply_params_and_enable_pid(self, channel, params)` in `blacs_workers.py` t
 | File | Change |
 |------|--------|
 | `rp_lockbox/blacs_workers.py` | Add `apply_params_and_enable_pid` after `apply_pid_params`. |
-| `rp_lockbox/blacs_tabs.py` | PSD-only helpers; `_enable_pid` / `_disable_pid`; single `queue_work` for enable; clarify full-pause docstring. |
+| `rp_lockbox/blacs_tabs.py` | PSD-only helpers; `_enable_pid` / `_disable_pid`; single `queue_work` for enable; full pause for Apply/Reset/Refresh; **200 ms auto PSD+stats timer** (so PSD-only pause has an effect; manual Acquire buttons unchanged). |
+
+**Implemented** on branch `main` after this plan was committed.
 
 ## Risk / tradeoff
 

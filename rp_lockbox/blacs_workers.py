@@ -266,6 +266,16 @@ class RPLockboxWorker(Worker):
             readbacks[key] = self.set_pid_param(channel, key, params[key])
         return readbacks
 
+    def apply_params_and_enable_pid(self, channel, params):
+        """Apply panel PID fields then enable the loop in one BLACS worker job.
+
+        Avoids an extra tab-level ``queue_work`` round-trip versus calling
+        ``apply_pid_params`` and ``enable_pid`` separately.
+        """
+        readbacks = self.apply_pid_params(channel, params)
+        enable_diag = self.enable_pid(channel)
+        return {'readbacks': readbacks, 'enable': enable_diag}
+
     def enable_pid(self, channel):
         pid = self.pids[channel]
         if self._asg_active[channel]:
