@@ -5,17 +5,13 @@
 - All tab actions use the same **RPLockboxWorker** FIFO: `get_trace_data`, `compute_psd`, `get_stats`, and PID helpers (`rp_lockbox/blacs_workers.py`).
 - **Disable** only calls `disable_pid` (two PyRPL assignments). **Enable** currently does two separate `queue_work` calls: `apply_pid_params` then `enable_pid` (`rp_lockbox/blacs_tabs.py`).
 - **Disable** as delayed as **Enable** suggests the bottleneck is often **shared queue / contention**, not only eight parameters on enable.
-- `_pause_timers_for_pid_ops` stops both the trace timer (100 ms) and the PSD/stats timer (200 ms) for every PID-related click, which removes live traces during Enable/Disable while not cancelling work already queued on the worker.
+- `_pause_timers_for_pid_ops` stops the trace refresh timer (100 ms) during PID-related clicks to cut worker FIFO contention. **The 200 ms auto PSD/stats timer was removed** after it caused regressions; PSD/histogram update via **Acquire PSD** / **Acquire Stats** only.
 
 ## Proposed changes
 
-### 1. PSD/stats-only pause for Enable and Disable
+### 1. Pause trace timer for Enable / Disable (revised)
 
-Add `_pause_psd_stats_timer_for_pid_ops` / `_resume_psd_stats_timer_for_pid_ops` that stop/start only `_psd_stats_timer`. Use these in `_enable_pid` and `_disable_pid` instead of full pause.
-
-**Keep** full pause for `_apply_pid_params`, `_reset_pid`, and `_refresh_status`.
-
-**Why it helps:** PSD + stats (`compute_psd` then `get_stats` every 200 ms) competes for the same worker. Pausing only that timer during Enable/Disable reduces new heavy jobs while keeping the trace path live.
+**Superseded:** PSD-only pause + auto PSD timer was reverted. **Current behavior:** `_enable_pid` / `_disable_pid` use the same trace-timer pause as Apply/Reset/Refresh so `get_trace_data` does not queue ahead of the PID job (traces freeze briefly during the click).
 
 ### 2. Single merged `queue_work` for Enable
 
@@ -33,13 +29,13 @@ Add `apply_params_and_enable_pid(self, channel, params)` in `blacs_workers.py` t
 | File | Change |
 |------|--------|
 | `rp_lockbox/blacs_workers.py` | Add `apply_params_and_enable_pid` after `apply_pid_params`. |
-| `rp_lockbox/blacs_tabs.py` | PSD-only helpers; `_enable_pid` / `_disable_pid`; single `queue_work` for enable; full pause for Apply/Reset/Refresh; **200 ms auto PSD+stats timer** (so PSD-only pause has an effect; manual Acquire buttons unchanged). |
+| `rp_lockbox/blacs_tabs.py` | Trace timer pause for PID ops; `_enable_pid` / `_disable_pid`; single `queue_work` for enable; `_apply_psd_worker_result` / `_apply_stats_worker_result` for **manual** Acquire only (no auto PSD timer). |
 
-**Implemented** on branch `main` after this plan was committed.
+**Implemented** on `main`, then auto PSD timer **removed** in a follow-up.
 
 ## Risk / tradeoff
 
-During Enable/Disable, `get_trace_data` may still queue on the worker; intentional for live traces and usually cheaper than PSD+stats.
+During Enable/Disable, the trace timer is paused so `get_trace_data` does not compete in the worker queue for that interval (traces briefly freeze).
 
 ## Success criteria (manual)
 

@@ -1,4 +1,5 @@
 import os
+import time
 import math
 import logging
 
@@ -22,9 +23,6 @@ _ALL_DEVICE_MODES = (
     | MODE_TRANSITION_TO_BUFFERED
     | MODE_TRANSITION_TO_MANUAL
 )
-
-# Auto-refresh interval for PSD + histogram (active channel). Lower = more RP/worker load.
-PSD_STATS_REFRESH_MS = 200
 
 from qtutils.qt.QtCore import QTimer
 from qtutils.qt.QtWidgets import (
@@ -337,11 +335,6 @@ class RPLockboxTab(DeviceTab):
         self._refresh_timer.timeout.connect(self._on_refresh_tick)
         self._refresh_timer.start()
 
-        self._psd_stats_timer = QTimer()
-        self._psd_stats_timer.setInterval(PSD_STATS_REFRESH_MS)
-        self._psd_stats_timer.timeout.connect(self._on_psd_stats_refresh_tick)
-        self._psd_stats_timer.start()
-
     def initialise_workers(self):
         conn = self.settings['connection_table']
         dev = conn.find_by_name(self.device_name)
@@ -387,30 +380,12 @@ class RPLockboxTab(DeviceTab):
             panel.trace_setpoint_line.setValue(result['setpoint'])
             panel.trace_setpoint_line.setVisible(panel.trace_show_setpoint_check.isChecked())
 
-    @define_state(_ALL_DEVICE_MODES, True, True)
-    def _on_psd_stats_refresh_tick(self):
-        """Periodically update PSD and histogram for the currently visible channel."""
-        active_ch = self.ch_tabs.currentIndex()
-        psd_result = yield self.queue_work(self.primary_worker, 'compute_psd', active_ch)
-        self._apply_psd_worker_result(active_ch, psd_result)
-        stats_result = yield self.queue_work(self.primary_worker, 'get_stats', active_ch)
-        self._apply_stats_worker_result(active_ch, stats_result)
-
     def _pause_timers_for_pid_ops(self):
-        """Stop trace + PSD/stats timers (contention avoidance for Apply/Reset/Refresh)."""
+        """Stop voltage trace refresh to reduce worker FIFO contention during PID ops."""
         self._refresh_timer.stop()
-        self._psd_stats_timer.stop()
 
     def _resume_timers_for_pid_ops(self):
         self._refresh_timer.start()
-        self._psd_stats_timer.start()
-
-    def _pause_psd_stats_timer_for_pid_ops(self):
-        """Stop only PSD/stats timer so voltage traces keep updating during Enable/Disable."""
-        self._psd_stats_timer.stop()
-
-    def _resume_psd_stats_timer_for_pid_ops(self):
-        self._psd_stats_timer.start()
 
     # ── PID parameter methods ────────────────────────────────────────
 
@@ -499,7 +474,7 @@ class RPLockboxTab(DeviceTab):
 
     @define_state(MODE_MANUAL, True)
     def _enable_pid(self, channel):
-        self._pause_psd_stats_timer_for_pid_ops()
+        self._pause_timers_for_pid_ops()
         try:
             panel = self.panels[channel]
             params = self._parse_pid_panel_params(panel)
@@ -507,6 +482,11 @@ class RPLockboxTab(DeviceTab):
                 return
             if params['min_voltage'] >= params['max_voltage']:
                 return
+            LOG.info(
+                '[rp_lockbox tab timing] _enable_pid ch=%s pre_queue_wall=%.3f',
+                channel,
+                time.time(),
+            )
             result = yield self.queue_work(
                 self.primary_worker, 'apply_params_and_enable_pid', channel, params,
             )
@@ -537,15 +517,20 @@ class RPLockboxTab(DeviceTab):
                     except AttributeError:
                         LOG.info(msg)
         finally:
-            self._resume_psd_stats_timer_for_pid_ops()
+            self._resume_timers_for_pid_ops()
 
     @define_state(MODE_MANUAL, True)
     def _disable_pid(self, channel):
-        self._pause_psd_stats_timer_for_pid_ops()
+        self._pause_timers_for_pid_ops()
         try:
+            LOG.info(
+                '[rp_lockbox tab timing] _disable_pid ch=%s pre_queue_wall=%.3f',
+                channel,
+                time.time(),
+            )
             yield self.queue_work(self.primary_worker, 'disable_pid', channel)
         finally:
-            self._resume_psd_stats_timer_for_pid_ops()
+            self._resume_timers_for_pid_ops()
 
     @define_state(MODE_MANUAL, True)
     def _reset_pid(self, channel):
@@ -649,7 +634,11 @@ class RPLockboxTab(DeviceTab):
     # ── PSD / Stats ──────────────────────────────────────────────────
 
     def _apply_psd_worker_result(self, channel, result):
-        """Update PSD plot from ``compute_psd`` return dict."""
+        """Update PSD plot from ``compute_psd`` return dict.
+
+        Plot logic matches the pre-refactor ``_acquire_psd`` inline implementation
+        (same error handling, arrays, and ``_apply_psd_plot_ranges`` usage).
+        """
         p = self.panels[channel]
         if not isinstance(result, dict):
             p.psd_curve.setData([], [])
@@ -687,7 +676,10 @@ class RPLockboxTab(DeviceTab):
             p.psd_rms_label.setText('PSD: no data (check input / worker log)')
 
     def _apply_stats_worker_result(self, channel, result):
-        """Update histogram from ``get_stats`` return dict."""
+        """Update histogram from ``get_stats`` return dict.
+
+        Plot logic matches the pre-refactor ``_acquire_stats`` inline implementation.
+        """
         p = self.panels[channel]
 
         def _clear_stats_plot():

@@ -19,6 +19,10 @@ from blacs.tab_base_classes import Worker
 
 LOG = logging.getLogger(__name__)
 
+# Worker-side timing for BLACS queue diagnosis (see docs/rp_lockbox_worker_timing.md).
+_WORKER_TIMING_TRACE_INTERVAL_S = 5.0
+_WORKER_TIMING_TRACE_SLOW_MS = 400.0
+
 # ASG: never use frequency=0 (invalid for internal timing). DC uses a dummy Hz.
 ASG_MIN_FREQ_HZ = 0.1
 ASG_DC_FREQ_PLACEHOLDER_HZ = 1e3
@@ -139,6 +143,7 @@ class RPLockboxWorker(Worker):
             'out2': deque(maxlen=TRACE_BUFLEN),
         }
         self._t0 = time.monotonic()
+        self._worker_trace_timing_last_log = 0.0
 
         try:
             ch1, ch2 = _read_scope_raw(sc, MONITOR_DECIMATION)
@@ -158,6 +163,7 @@ class RPLockboxWorker(Worker):
         scope acquisitions (inputs then DAC outputs) so the output trace
         reflects real BNC voltage, not pid.ival.
         """
+        t0 = time.monotonic()
         try:
             sc = self.rp.scope
             saved_in1 = sc.input1
@@ -181,6 +187,20 @@ class RPLockboxWorker(Worker):
             self._trace_bufs['out2'].append(float(out2.mean()))
         except Exception:
             LOG.exception('get_trace_data acquisition failed')
+        finally:
+            dt_ms = (time.monotonic() - t0) * 1000.0
+            now = time.monotonic()
+            last = getattr(self, '_worker_trace_timing_last_log', 0.0)
+            if (
+                dt_ms >= _WORKER_TIMING_TRACE_SLOW_MS
+                or (now - last) >= _WORKER_TIMING_TRACE_INTERVAL_S
+            ):
+                LOG.info(
+                    '[rp_lockbox worker timing] get_trace_data ch=%s body_ms=%.1f',
+                    channel,
+                    dt_ms,
+                )
+                self._worker_trace_timing_last_log = now
 
         in_key = f'in{channel + 1}'
         out_key = f'out{channel + 1}'
@@ -272,8 +292,28 @@ class RPLockboxWorker(Worker):
         Avoids an extra tab-level ``queue_work`` round-trip versus calling
         ``apply_pid_params`` and ``enable_pid`` separately.
         """
+        LOG.info(
+            '[rp_lockbox worker timing] apply_params_and_enable_pid ch=%s enter_wall=%.3f',
+            channel,
+            time.time(),
+        )
+        t_all = time.monotonic()
+        t_apply0 = time.monotonic()
         readbacks = self.apply_pid_params(channel, params)
+        apply_ms = (time.monotonic() - t_apply0) * 1000.0
+        t_en0 = time.monotonic()
         enable_diag = self.enable_pid(channel)
+        enable_ms = (time.monotonic() - t_en0) * 1000.0
+        total_ms = (time.monotonic() - t_all) * 1000.0
+        LOG.info(
+            '[rp_lockbox worker timing] apply_params_and_enable_pid ch=%s '
+            'apply_pid_params_ms=%.1f enable_pid_ms=%.1f total_ms=%.1f exit_wall=%.3f',
+            channel,
+            apply_ms,
+            enable_ms,
+            total_ms,
+            time.time(),
+        )
         return {'readbacks': readbacks, 'enable': enable_diag}
 
     def enable_pid(self, channel):
@@ -319,9 +359,22 @@ class RPLockboxWorker(Worker):
         return diag
 
     def disable_pid(self, channel):
+        LOG.info(
+            '[rp_lockbox worker timing] disable_pid ch=%s enter_wall=%.3f',
+            channel,
+            time.time(),
+        )
+        t0 = time.monotonic()
         pid = self.pids[channel]
         pid.paused = True
         pid.output_direct = 'off'
+        dt_ms = (time.monotonic() - t0) * 1000.0
+        LOG.info(
+            '[rp_lockbox worker timing] disable_pid ch=%s body_ms=%.1f exit_wall=%.3f',
+            channel,
+            dt_ms,
+            time.time(),
+        )
         return pid.paused
 
     def reset_pid(self, channel):
@@ -390,6 +443,7 @@ class RPLockboxWorker(Worker):
                 'error': 'scipy is not installed (need scipy.signal.welch)',
             }
 
+        t_job = time.monotonic()
         try:
             scope = self.rp.scope
             saved_in1 = scope.input1
@@ -447,9 +501,18 @@ class RPLockboxWorker(Worker):
             if len(msg) > 240:
                 msg = msg[:237] + '...'
             return {'freqs': [], 'psd': [], 'rms': 0.0, 'error': msg}
+        finally:
+            dt_ms = (time.monotonic() - t_job) * 1000.0
+            if dt_ms >= 500.0:
+                LOG.info(
+                    '[rp_lockbox worker timing] compute_psd ch=%s body_ms=%.1f',
+                    channel,
+                    dt_ms,
+                )
 
     def get_stats(self, channel, decimation=64):
         """Acquire scope burst and return histogram statistics."""
+        t_job = time.monotonic()
         try:
             scope = self.rp.scope
             saved_in1 = scope.input1
@@ -494,6 +557,14 @@ class RPLockboxWorker(Worker):
                 'hist_edges': [],
                 'error': msg,
             }
+        finally:
+            dt_ms = (time.monotonic() - t_job) * 1000.0
+            if dt_ms >= 500.0:
+                LOG.info(
+                    '[rp_lockbox worker timing] get_stats ch=%s body_ms=%.1f',
+                    channel,
+                    dt_ms,
+                )
 
     # ── ASG waveform output ──────────────────────────────────────────
 
