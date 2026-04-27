@@ -5,7 +5,7 @@
 - All tab actions use the same **RPLockboxWorker** FIFO: `get_trace_data`, `compute_psd`, `get_stats`, and PID helpers (`rp_lockbox/blacs_workers.py`).
 - **Disable** only calls `disable_pid` (two PyRPL assignments). **Enable** currently does two separate `queue_work` calls: `apply_pid_params` then `enable_pid` (`rp_lockbox/blacs_tabs.py`).
 - **Disable** as delayed as **Enable** suggests the bottleneck is often **shared queue / contention**, not only eight parameters on enable.
-- `_pause_timers_for_pid_ops` stops the trace refresh timer (100 ms) during PID-related clicks to cut worker FIFO contention. **The 200 ms auto PSD/stats timer was removed** after it caused regressions; PSD/histogram update via **Acquire PSD** / **Acquire Stats** only.
+- `_pause_timers_for_pid_ops` stops the trace refresh timer (100 ms) and the **continuous PSD + histogram timer** (~400 ms) during PID-related clicks to cut worker FIFO contention.
 
 ## Proposed changes
 
