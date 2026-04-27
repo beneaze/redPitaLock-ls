@@ -24,6 +24,8 @@ _ALL_DEVICE_MODES = (
     | MODE_TRANSITION_TO_MANUAL
 )
 
+# Continuous PSD (Welch) + input histogram for the active channel. Paused with the trace timer during PID ops.
+_PSD_STATS_REFRESH_MS = 400
 from qtutils.qt.QtCore import QTimer
 from qtutils.qt.QtWidgets import (
     QWidget, QTabWidget, QGridLayout, QVBoxLayout, QHBoxLayout,
@@ -34,33 +36,6 @@ from qtutils.qt.QtCore import Qt
 
 import numpy as np
 import pyqtgraph as pg
-
-
-def _pad_log_range(lo, hi, pad_frac=0.08):
-    """Expand positive [lo, hi] symmetrically in log10 space (for PSD axis padding)."""
-    if lo <= 0 or hi <= 0 or not (math.isfinite(lo) and math.isfinite(hi)):
-        return lo, hi
-    log_lo = math.log10(lo)
-    log_hi = math.log10(hi)
-    span = max(log_hi - log_lo, 1e-12)
-    margin = span * pad_frac
-    return 10 ** (log_lo - margin), 10 ** (log_hi + margin)
-
-
-def _apply_psd_plot_ranges(plot_widget, freqs, psd, pad_frac=0.08):
-    """Set PSD PlotWidget X/Y ranges from data (log mode uses linear axis values)."""
-    fa = np.asarray(freqs, dtype=np.float64)
-    pa = np.asarray(psd, dtype=np.float64)
-    fa = fa[np.isfinite(fa) & (fa > 0)]
-    pa = pa[np.isfinite(pa) & (pa > 0)]
-    if fa.size == 0 or pa.size == 0:
-        return
-    f_lo, f_hi = float(np.min(fa)), float(np.max(fa))
-    p_lo, p_hi = float(np.min(pa)), float(np.max(pa))
-    f_lo, f_hi = _pad_log_range(f_lo, f_hi, pad_frac)
-    p_lo, p_hi = _pad_log_range(p_lo, p_hi, pad_frac)
-    plot_widget.setXRange(f_lo, f_hi, padding=0)
-    plot_widget.setYRange(p_lo, p_hi, padding=0)
 
 
 class ChannelPanel(QWidget):
@@ -271,18 +246,24 @@ class ChannelPanel(QWidget):
         lay = QVBoxLayout(w)
         self.psd_plot = pg.PlotWidget(title=f'Ch{self.ch} PSD')
         self.psd_plot.setLabel('bottom', 'Frequency', 'Hz')
-        self.psd_plot.setLabel('left', 'PSD', 'V²/Hz')
-        self.psd_plot.setLogMode(x=True, y=True)
+        # y=False: we pass y=log10(V²/Hz) ourselves; y=True double-maps and breaks setYRange/labels.
+        self.psd_plot.setLabel('left', 'log10(PSD)', 'V²/Hz')
+        self.psd_plot.setLogMode(x=True, y=False)
         self.psd_plot.showGrid(x=True, y=True)
         self.psd_curve = self.psd_plot.plot(pen=pg.mkPen('g', width=2))
+        self.psd_plot.getViewBox().enableAutoRange(x=True, y=False)
+        self.psd_plot.getViewBox().invertY(False)
+        self.psd_plot.setYRange(-7.0, 3.0, padding=0)  # 10**-7 … 10**3
+        # Avoid view-dependent clipping/mangling of the plotted series.
+        self.psd_curve.setDynamicRangeLimit(None)
+        self.psd_curve.setClipToView(False)
+        self.psd_curve.setDownsampling(ds=1, auto=False)
         self.psd_rms_label = QLabel('RMS: --')
-        btn_row = QHBoxLayout()
-        self.btn_psd = QPushButton('Acquire PSD')
-        btn_row.addWidget(self.btn_psd)
-        btn_row.addWidget(self.psd_rms_label)
-        btn_row.addStretch()
+        rms_row = QHBoxLayout()
+        rms_row.addWidget(self.psd_rms_label)
+        rms_row.addStretch()
         lay.addWidget(self.psd_plot)
-        lay.addLayout(btn_row)
+        lay.addLayout(rms_row)
         return w
 
     def _build_stats_plot(self):
@@ -304,13 +285,11 @@ class ChannelPanel(QWidget):
         self.stats_plot.addItem(self.stats_step_curve)
         self.stats_step_curve.setVisible(False)
         self.stats_label = QLabel('μ=--  σ=--')
-        btn_row = QHBoxLayout()
-        self.btn_stats = QPushButton('Acquire Stats')
-        btn_row.addWidget(self.btn_stats)
-        btn_row.addWidget(self.stats_label)
-        btn_row.addStretch()
+        stats_row = QHBoxLayout()
+        stats_row.addWidget(self.stats_label)
+        stats_row.addStretch()
         lay.addWidget(self.stats_plot)
-        lay.addLayout(btn_row)
+        lay.addLayout(stats_row)
         return w
 
 
@@ -334,6 +313,11 @@ class RPLockboxTab(DeviceTab):
         self._refresh_timer.setInterval(100)
         self._refresh_timer.timeout.connect(self._on_refresh_tick)
         self._refresh_timer.start()
+
+        self._psd_stats_timer = QTimer()
+        self._psd_stats_timer.setInterval(_PSD_STATS_REFRESH_MS)
+        self._psd_stats_timer.timeout.connect(self._on_psd_stats_tick)
+        self._psd_stats_timer.start()
 
     def initialise_workers(self):
         conn = self.settings['connection_table']
@@ -363,9 +347,6 @@ class RPLockboxTab(DeviceTab):
         p.btn_wf_apply.clicked.connect(lambda _, c=ch: self._apply_waveform(c))
         p.btn_wf_stop.clicked.connect(lambda _, c=ch: self._stop_waveform(c))
 
-        p.btn_psd.clicked.connect(lambda _, c=ch: self._acquire_psd(c))
-        p.btn_stats.clicked.connect(lambda _, c=ch: self._acquire_stats(c))
-
     # ── Timer-driven trace refresh ───────────────────────────────────
 
     @define_state(_ALL_DEVICE_MODES, True, True)
@@ -380,12 +361,22 @@ class RPLockboxTab(DeviceTab):
             panel.trace_setpoint_line.setValue(result['setpoint'])
             panel.trace_setpoint_line.setVisible(panel.trace_show_setpoint_check.isChecked())
 
+    @define_state(_ALL_DEVICE_MODES, True, True)
+    def _on_psd_stats_tick(self):
+        active_ch = self.ch_tabs.currentIndex()
+        psd_result = yield self.queue_work(self.primary_worker, 'compute_psd', active_ch)
+        self._apply_psd_worker_result(active_ch, psd_result)
+        stats_result = yield self.queue_work(self.primary_worker, 'get_stats', active_ch)
+        self._apply_stats_worker_result(active_ch, stats_result)
+
     def _pause_timers_for_pid_ops(self):
-        """Stop voltage trace refresh to reduce worker FIFO contention during PID ops."""
+        """Stop trace + continuous PSD/stats to reduce worker FIFO contention during PID ops."""
         self._refresh_timer.stop()
+        self._psd_stats_timer.stop()
 
     def _resume_timers_for_pid_ops(self):
         self._refresh_timer.start()
+        self._psd_stats_timer.start()
 
     # ── PID parameter methods ────────────────────────────────────────
 
@@ -634,11 +625,7 @@ class RPLockboxTab(DeviceTab):
     # ── PSD / Stats ──────────────────────────────────────────────────
 
     def _apply_psd_worker_result(self, channel, result):
-        """Update PSD plot from ``compute_psd`` return dict.
-
-        Plot logic matches the pre-refactor ``_acquire_psd`` inline implementation
-        (same error handling, arrays, and ``_apply_psd_plot_ranges`` usage).
-        """
+        """Update PSD: ``setData`` only; ViewBox autoscaling handles the axes (``_build_psd_plot``)."""
         p = self.panels[channel]
         if not isinstance(result, dict):
             p.psd_curve.setData([], [])
@@ -658,19 +645,26 @@ class RPLockboxTab(DeviceTab):
         if freqs and psd:
             fx = np.asarray(freqs, dtype=np.float64)
             py = np.asarray(psd, dtype=np.float64)
-            p.psd_curve.setData(fx, py)
-            p.psd_rms_label.setText(f'RMS: {rms:.4g} V')
-            _apply_psd_plot_ranges(p.psd_plot, fx, py)
-            try:
-                self.logger.debug(
-                    'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
-                    channel, len(fx), float(np.min(fx)), float(np.max(fx)),
-                )
-            except AttributeError:
-                LOG.debug(
-                    'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
-                    channel, len(fx), float(np.min(fx)), float(np.max(fx)),
-                )
+            # Log mode: skip nonpositive bin values for a valid log plot.
+            good = (fx > 0) & (py > 0) & np.isfinite(fx) & np.isfinite(py)
+            if not good.any():
+                p.psd_curve.setData([], [])
+                p.psd_rms_label.setText('PSD: no data (check input / worker log)')
+            else:
+                f_ok = fx[good]
+                p_y = py[good]
+                p.psd_rms_label.setText(f'RMS: {rms:.4g} V')
+                p.psd_curve.setData(f_ok, np.log10(np.maximum(p_y, 1e-300)))
+                try:
+                    self.logger.debug(
+                        'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
+                        channel, len(f_ok), float(f_ok.min()), float(f_ok.max()),
+                    )
+                except AttributeError:
+                    LOG.debug(
+                        'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
+                        channel, len(f_ok), float(f_ok.min()), float(f_ok.max()),
+                    )
         else:
             p.psd_curve.setData([], [])
             p.psd_rms_label.setText('PSD: no data (check input / worker log)')
@@ -759,12 +753,3 @@ class RPLockboxTab(DeviceTab):
                 channel, len(counts_arr), bar_ok, float(np.sum(counts_arr)),
             )
 
-    @define_state(_ALL_DEVICE_MODES, True)
-    def _acquire_psd(self, channel):
-        result = yield self.queue_work(self.primary_worker, 'compute_psd', channel)
-        self._apply_psd_worker_result(channel, result)
-
-    @define_state(_ALL_DEVICE_MODES, True)
-    def _acquire_stats(self, channel):
-        result = yield self.queue_work(self.primary_worker, 'get_stats', channel)
-        self._apply_stats_worker_result(channel, result)
