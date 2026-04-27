@@ -233,6 +233,12 @@ class ChannelPanel(QWidget):
         trace_split.addWidget(self.trace_output_plot)
         trace_split.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         lay.addWidget(trace_split, stretch=1)
+
+        self.trace_status_label = QLabel('')
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.trace_status_label)
+        status_row.addStretch()
+        lay.addLayout(status_row)
         return w
 
     def _on_trace_setpoint_visibility_toggled(self, checked):
@@ -360,7 +366,18 @@ class RPLockboxTab(DeviceTab):
         if self.ch_tabs.currentIndex() != requested_ch:
             return
         panel = self.panels[requested_ch]
-        if result and result.get('times'):
+        if not isinstance(result, dict):
+            panel.trace_status_label.setText(
+                'Trace failed: worker error (see BLACS worker log)',
+            )
+            return
+        err = result.get('error')
+        if err:
+            short = str(err) if len(str(err)) <= 100 else str(err)[:97] + '...'
+            panel.trace_status_label.setText(f'Trace acquisition failed: {short}')
+        else:
+            panel.trace_status_label.setText('')
+        if result.get('times'):
             t = result['times']
             panel.trace_input_curve.setData(t, result['input'])
             panel.trace_output_curve.setData(t, result['output'])
