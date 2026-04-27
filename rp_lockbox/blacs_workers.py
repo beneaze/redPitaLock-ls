@@ -164,6 +164,7 @@ class RPLockboxWorker(Worker):
         reflects real BNC voltage, not pid.ival.
         """
         t0 = time.monotonic()
+        acq_error = None
         try:
             sc = self.rp.scope
             saved_in1 = sc.input1
@@ -185,8 +186,12 @@ class RPLockboxWorker(Worker):
             self._trace_bufs['in2'].append(float(ch2.mean()))
             self._trace_bufs['out1'].append(float(out1.mean()))
             self._trace_bufs['out2'].append(float(out2.mean()))
-        except Exception:
+        except Exception as e:
             LOG.exception('get_trace_data acquisition failed')
+            msg = str(e).replace('\n', ' ')
+            if len(msg) > 240:
+                msg = msg[:237] + '...'
+            acq_error = msg
         finally:
             dt_ms = (time.monotonic() - t0) * 1000.0
             now = time.monotonic()
@@ -205,12 +210,15 @@ class RPLockboxWorker(Worker):
         in_key = f'in{channel + 1}'
         out_key = f'out{channel + 1}'
         pid = self.pids[channel]
-        return {
+        result = {
             'times': list(self._trace_bufs['time']),
             'input': list(self._trace_bufs[in_key]),
             'output': list(self._trace_bufs[out_key]),
             'setpoint': float(pid.setpoint),
         }
+        if acq_error is not None:
+            result['error'] = acq_error
+        return result
 
     # ── PID parameter control ────────────────────────────────────────
 
@@ -270,15 +278,19 @@ class RPLockboxWorker(Worker):
         else:
             raise ValueError(f'Unknown parameter: {name}')
 
+    # Fixed application order for PID parameters -- used by both manual apply
+    # and buffered transitions so FPGA register updates are deterministic.
+    _PID_PARAM_ORDER = (
+        'min_voltage', 'max_voltage', 'setpoint', 'p', 'i', 'ival', 'pause_gains',
+    )
+
     def apply_pid_params(self, channel, params):
         """Apply several PID fields in one worker job (single BLACS queue round-trip).
 
         params: dict with keys among min_voltage, max_voltage, setpoint, p, i, ival,
         pause_gains. Application order is fixed for sensible FPGA updates.
         """
-        order = (
-            'min_voltage', 'max_voltage', 'setpoint', 'p', 'i', 'ival', 'pause_gains',
-        )
+        order = self._PID_PARAM_ORDER
         readbacks = {}
         for key in order:
             if key not in params:
@@ -365,6 +377,8 @@ class RPLockboxWorker(Worker):
             time.time(),
         )
         t0 = time.monotonic()
+        if self._asg_active[channel]:
+            self.stop_asg_output(channel)
         pid = self.pids[channel]
         pid.paused = True
         pid.output_direct = 'off'
@@ -378,6 +392,8 @@ class RPLockboxWorker(Worker):
         return pid.paused
 
     def reset_pid(self, channel):
+        if self._asg_active[channel]:
+            self.stop_asg_output(channel)
         pid = self.pids[channel]
         pid.p = 0
         pid.i = 0
@@ -397,31 +413,52 @@ class RPLockboxWorker(Worker):
             array = array + [0.0] * (16 - len(array))
         elif len(array) > 16:
             array = array[:16]
-        pid.set_setpoint_array(array)
-        pid.use_setpoint_sequence = True
+        try:
+            pid.set_setpoint_array(array)
+            pid.use_setpoint_sequence = True
+        except AttributeError:
+            LOG.warning('set_setpoint_sequence: FPGA/PyRPL does not support sequences')
+            return {'error': 'setpoint sequences not supported by this bitfile'}
         return array
 
     def disable_setpoint_sequence(self, channel):
         pid = self.pids[channel]
-        pid.use_setpoint_sequence = False
+        try:
+            pid.use_setpoint_sequence = False
+        except AttributeError:
+            LOG.warning('disable_setpoint_sequence: not supported by this bitfile')
         return True
 
     def reset_sequence_index(self, channel):
-        self.pids[channel].reset_sequence_index()
+        try:
+            self.pids[channel].reset_sequence_index()
+        except AttributeError:
+            LOG.warning('reset_sequence_index: not supported by this bitfile')
         return True
 
     def step_sequence(self, channel):
-        self.pids[channel].manually_change_setpoint()
+        try:
+            self.pids[channel].manually_change_setpoint()
+        except AttributeError:
+            LOG.warning('step_sequence: not supported by this bitfile')
         return True
 
     def get_sequence_status(self, channel):
         pid = self.pids[channel]
-        return {
-            'use_sequence': bool(pid.use_setpoint_sequence),
-            'index': int(pid.setpoint_index),
-            'current_setpoint': float(pid.setpoint_in_sequence),
-            'wrap_flag': bool(pid.sequence_wrap_flag),
-        }
+        try:
+            return {
+                'use_sequence': bool(pid.use_setpoint_sequence),
+                'index': int(pid.setpoint_index),
+                'current_setpoint': float(pid.setpoint_in_sequence),
+                'wrap_flag': bool(pid.sequence_wrap_flag),
+            }
+        except AttributeError:
+            return {
+                'use_sequence': False,
+                'index': 0,
+                'current_setpoint': 0.0,
+                'wrap_flag': False,
+            }
 
     # ── PSD and statistics ───────────────────────────────────────────
 
@@ -631,31 +668,31 @@ class RPLockboxWorker(Worker):
                 if ch_grp is None:
                     continue
                 pid = self.pids[ch]
-                for key in ch_grp:
-                    val = ch_grp[key][()]
-                    if isinstance(val, bytes):
-                        val = val.decode('utf-8')
-                    if key == 'setpoint_sequence':
-                        arr = list(ch_grp[key][:])
-                        if len(arr) < 16:
-                            arr = arr + [0.0] * (16 - len(arr))
-                        pid.set_setpoint_array(arr)
-                        pid.use_setpoint_sequence = True
-                        pid.reset_sequence_index()
-                    elif key == 'p':
-                        pid.p = float(val)
-                    elif key == 'i':
-                        pid.i = float(val)
-                    elif key == 'setpoint':
-                        pid.setpoint = float(val)
-                    elif key == 'min_voltage':
-                        pid.min_voltage = float(val)
-                    elif key == 'max_voltage':
-                        pid.max_voltage = float(val)
-                    elif key == 'pause_gains':
-                        pid.pause_gains = str(val)
-                    elif key == 'inputfilter':
-                        pid.inputfilter = list(ch_grp[key][:])
+
+                def _read_val(k):
+                    v = ch_grp[k][()]
+                    if isinstance(v, bytes):
+                        v = v.decode('utf-8')
+                    return v
+
+                # Apply scalar PID params in the same fixed order as manual apply.
+                for key in self._PID_PARAM_ORDER:
+                    if key not in ch_grp:
+                        continue
+                    self.set_pid_param(ch, key, _read_val(key))
+
+                if 'inputfilter' in ch_grp:
+                    pid.inputfilter = list(ch_grp['inputfilter'][:])
+
+                if 'setpoint_sequence' in ch_grp:
+                    arr = list(ch_grp['setpoint_sequence'][:])
+                    if len(arr) < 16:
+                        arr = arr + [0.0] * (16 - len(arr))
+                    elif len(arr) > 16:
+                        arr = arr[:16]
+                    pid.set_setpoint_array(arr)
+                    pid.use_setpoint_sequence = True
+                    pid.reset_sequence_index()
         return {}
 
     def transition_to_manual(self):
@@ -667,6 +704,9 @@ class RPLockboxWorker(Worker):
         return results
 
     def abort_buffered(self):
+        for ch in range(len(self.pids)):
+            if self._asg_active[ch]:
+                self.stop_asg_output(ch)
         for pid in self.pids:
             pid.pause_gains = 'pi'
             pid.paused = True
@@ -684,3 +724,8 @@ class RPLockboxWorker(Worker):
         for asg in self.asgs:
             asg.output_direct = 'off'
             asg.amplitude = 0
+        if hasattr(self, 'p') and self.p is not None:
+            try:
+                self.p._clear()
+            except Exception:
+                LOG.debug('Pyrpl._clear() failed during shutdown', exc_info=True)

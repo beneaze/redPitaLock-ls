@@ -41,10 +41,9 @@ import pyqtgraph as pg
 class ChannelPanel(QWidget):
     """Control + monitoring panel for one PID channel."""
 
-    def __init__(self, channel, tab, parent=None):
+    def __init__(self, channel, parent=None):
         super().__init__(parent)
         self.ch = channel
-        self.tab = tab
         self._build_ui()
 
     def _build_ui(self):
@@ -296,12 +295,17 @@ class ChannelPanel(QWidget):
 class RPLockboxTab(DeviceTab):
     device_worker_class = 'user_devices.rp_lockbox.blacs_workers.RPLockboxWorker'
 
+    def _log(self, level, msg, *args):
+        """Log via self.logger if available (BLACS tab), otherwise module LOG."""
+        logger = getattr(self, 'logger', None) or LOG
+        getattr(logger, level)(msg, *args)
+
     def initialise_GUI(self):
         layout = self.get_tab_layout()
         self.ch_tabs = QTabWidget()
         self.panels = []
         for ch in (0, 1):
-            panel = ChannelPanel(ch, self)
+            panel = ChannelPanel(ch)
             self.panels.append(panel)
             self.ch_tabs.addTab(panel, f'Channel {ch}  (in{ch+1} / out{ch+1})')
         layout.addWidget(self.ch_tabs)
@@ -325,7 +329,7 @@ class RPLockboxTab(DeviceTab):
         ip = dev.properties.get('ip_addr')
         self.create_worker(
             'main',
-            'user_devices.rp_lockbox.blacs_workers.RPLockboxWorker',
+            self.device_worker_class,
             {'ip_addr': ip},
         )
         self.primary_worker = 'main'
@@ -351,9 +355,11 @@ class RPLockboxTab(DeviceTab):
 
     @define_state(_ALL_DEVICE_MODES, True, True)
     def _on_refresh_tick(self):
-        active_ch = self.ch_tabs.currentIndex()
-        panel = self.panels[active_ch]
-        result = yield self.queue_work(self.primary_worker, 'get_trace_data', active_ch)
+        requested_ch = self.ch_tabs.currentIndex()
+        result = yield self.queue_work(self.primary_worker, 'get_trace_data', requested_ch)
+        if self.ch_tabs.currentIndex() != requested_ch:
+            return
+        panel = self.panels[requested_ch]
         if result and result.get('times'):
             t = result['times']
             panel.trace_input_curve.setData(t, result['input'])
@@ -363,11 +369,14 @@ class RPLockboxTab(DeviceTab):
 
     @define_state(_ALL_DEVICE_MODES, True, True)
     def _on_psd_stats_tick(self):
-        active_ch = self.ch_tabs.currentIndex()
-        psd_result = yield self.queue_work(self.primary_worker, 'compute_psd', active_ch)
-        self._apply_psd_worker_result(active_ch, psd_result)
-        stats_result = yield self.queue_work(self.primary_worker, 'get_stats', active_ch)
-        self._apply_stats_worker_result(active_ch, stats_result)
+        requested_ch = self.ch_tabs.currentIndex()
+        psd_result = yield self.queue_work(self.primary_worker, 'compute_psd', requested_ch)
+        if self.ch_tabs.currentIndex() == requested_ch:
+            self._apply_psd_worker_result(requested_ch, psd_result)
+        requested_ch = self.ch_tabs.currentIndex()
+        stats_result = yield self.queue_work(self.primary_worker, 'get_stats', requested_ch)
+        if self.ch_tabs.currentIndex() == requested_ch:
+            self._apply_stats_worker_result(requested_ch, stats_result)
 
     def _pause_timers_for_pid_ops(self):
         """Stop trace + continuous PSD/stats to reduce worker FIFO contention during PID ops."""
@@ -415,9 +424,9 @@ class RPLockboxTab(DeviceTab):
             if isinstance(val, (int, float)):
                 edit.setText(f'{val:.6g}')
         if 'pause_gains' in readbacks:
-            pg = readbacks['pause_gains']
+            pg_val = readbacks['pause_gains']
             panel.pause_gains_combo.blockSignals(True)
-            panel.pause_gains_combo.setCurrentText(str(pg))
+            panel.pause_gains_combo.setCurrentText(str(pg_val))
             panel.pause_gains_combo.blockSignals(False)
 
     def _apply_status_dict_to_panel(self, channel, result):
@@ -452,8 +461,11 @@ class RPLockboxTab(DeviceTab):
             panel = self.panels[channel]
             params = self._parse_pid_panel_params(panel)
             if params is None:
+                LOG.warning('Apply PID ch%d: invalid numeric input in one or more fields', channel)
                 return
             if params['min_voltage'] >= params['max_voltage']:
+                LOG.warning('Apply PID ch%d: min_voltage (%.4g) must be < max_voltage (%.4g)',
+                            channel, params['min_voltage'], params['max_voltage'])
                 return
             result = yield self.queue_work(
                 self.primary_worker, 'apply_pid_params', channel, params,
@@ -470,8 +482,11 @@ class RPLockboxTab(DeviceTab):
             panel = self.panels[channel]
             params = self._parse_pid_panel_params(panel)
             if params is None:
+                LOG.warning('Enable PID ch%d: invalid numeric input in one or more fields', channel)
                 return
             if params['min_voltage'] >= params['max_voltage']:
+                LOG.warning('Enable PID ch%d: min_voltage (%.4g) must be < max_voltage (%.4g)',
+                            channel, params['min_voltage'], params['max_voltage'])
                 return
             LOG.info(
                 '[rp_lockbox tab timing] _enable_pid ch=%s pre_queue_wall=%.3f',
@@ -503,10 +518,7 @@ class RPLockboxTab(DeviceTab):
                         en.get('pause_gains'),
                         cos_s,
                     )
-                    try:
-                        self.logger.info(msg)
-                    except AttributeError:
-                        LOG.info(msg)
+                    self._log('info', msg)
         finally:
             self._resume_timers_for_pid_ops()
 
@@ -579,8 +591,10 @@ class RPLockboxTab(DeviceTab):
             else:
                 arr = [float(result)]
         except Exception:
+            LOG.warning('Sequence ch%d: failed to evaluate expression: %r', channel, text)
             return
         if len(arr) > 16:
+            LOG.warning('Sequence ch%d: array length %d exceeds maximum of 16', channel, len(arr))
             return
         yield self.queue_work(self.primary_worker, 'set_setpoint_sequence', channel, arr)
 
@@ -601,6 +615,10 @@ class RPLockboxTab(DeviceTab):
             p.seq_index_label.setText(f"Index: {result.get('index', 0)}")
             wrap = result.get('wrap_flag', False)
             p.seq_wrap_label.setText(f"Wrap: {'YES' if wrap else '--'}")
+            if wrap:
+                p.seq_wrap_label.setStyleSheet('color: green; font-weight: bold;')
+            else:
+                p.seq_wrap_label.setStyleSheet('')
 
     # ── Manual waveform ──────────────────────────────────────────────
 
@@ -655,16 +673,10 @@ class RPLockboxTab(DeviceTab):
                 p_y = py[good]
                 p.psd_rms_label.setText(f'RMS: {rms:.4g} V')
                 p.psd_curve.setData(f_ok, np.log10(np.maximum(p_y, 1e-300)))
-                try:
-                    self.logger.debug(
-                        'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
-                        channel, len(f_ok), float(f_ok.min()), float(f_ok.max()),
-                    )
-                except AttributeError:
-                    LOG.debug(
-                        'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
-                        channel, len(f_ok), float(f_ok.min()), float(f_ok.max()),
-                    )
+                self._log(
+                    'debug', 'PSD ch%d plotted: len=%d f=[%.4g, %.4g] Hz',
+                    channel, len(f_ok), float(f_ok.min()), float(f_ok.max()),
+                )
         else:
             p.psd_curve.setData([], [])
             p.psd_rms_label.setText('PSD: no data (check input / worker log)')
@@ -742,14 +754,8 @@ class RPLockboxTab(DeviceTab):
         p.stats_plot.setXRange(float(edges_arr[0]) - x_pad, float(edges_arr[-1]) + x_pad, padding=0)
         p.stats_plot.setYRange(0.0, y_max, padding=0)
         p.stats_label.setText(f'μ={mean:.4g}  σ={std:.4g}')
-        try:
-            self.logger.debug(
-                'Stats ch%d: bins=%d bar_ok=%r sum_counts=%.4g',
-                channel, len(counts_arr), bar_ok, float(np.sum(counts_arr)),
-            )
-        except AttributeError:
-            LOG.debug(
-                'Stats ch%d: bins=%d bar_ok=%r sum_counts=%.4g',
-                channel, len(counts_arr), bar_ok, float(np.sum(counts_arr)),
-            )
+        self._log(
+            'debug', 'Stats ch%d: bins=%d bar_ok=%r sum_counts=%.4g',
+            channel, len(counts_arr), bar_ok, float(np.sum(counts_arr)),
+        )
 

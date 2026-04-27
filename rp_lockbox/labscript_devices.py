@@ -1,6 +1,9 @@
+import logging
 import numpy as np
 from labscript import Device
 from labscript.labscript import set_passed_properties
+
+LOG = logging.getLogger(__name__)
 
 
 class RPLockbox(Device):
@@ -23,14 +26,25 @@ class RPLockbox(Device):
         self.BLACS_connection = ip_addr
         self._ch_params = {0: {}, 1: {}}
 
+    _VALID_PID_KEYS = frozenset({
+        'setpoint', 'p', 'i', 'ival', 'min_voltage', 'max_voltage',
+        'pause_gains', 'inputfilter',
+    })
+
     def set_pid_params(self, channel, **kwargs):
         """Set per-shot PID parameters for a channel.
 
-        Valid keys: setpoint, p, i, min_voltage, max_voltage, pause_gains,
-        inputfilter (list of 4 floats).
+        Valid keys: setpoint, p, i, ival, min_voltage, max_voltage,
+        pause_gains, inputfilter (list of 4 floats).
         """
         if channel not in (0, 1):
             raise ValueError(f"channel must be 0 or 1, got {channel}")
+        unknown = set(kwargs) - self._VALID_PID_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unknown PID parameter(s): {sorted(unknown)}. "
+                f"Valid keys: {sorted(self._VALID_PID_KEYS)}"
+            )
         self._ch_params[channel].update(kwargs)
 
     def set_setpoint_sequence(self, channel, array):
@@ -39,6 +53,10 @@ class RPLockbox(Device):
             raise ValueError(f"channel must be 0 or 1, got {channel}")
         array = list(array)
         if len(array) > 16:
+            LOG.warning(
+                'set_setpoint_sequence ch%d: truncating %d elements to 16',
+                channel, len(array),
+            )
             array = array[:16]
         self._ch_params[channel]['setpoint_sequence'] = array
 
