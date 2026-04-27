@@ -340,6 +340,18 @@ class RPLockboxTab(DeviceTab):
         )
         self.primary_worker = 'main'
 
+        try:
+            from rp_lockbox.influx_writer import create_writer
+            self._influx_writer = create_writer(
+                host_tag=ip or '',
+                device_tag=self.device_name,
+            )
+            self._influx_writer.start()
+        except Exception:
+            from rp_lockbox.influx_writer import _NoOpWriter
+            self._influx_writer = _NoOpWriter()
+            LOG.debug('InfluxDB writer not available', exc_info=True)
+
     def _connect_panel_signals(self, p):
         ch = p.ch
 
@@ -383,6 +395,13 @@ class RPLockboxTab(DeviceTab):
             panel.trace_output_curve.setData(t, result['output'])
             panel.trace_setpoint_line.setValue(result['setpoint'])
             panel.trace_setpoint_line.setVisible(panel.trace_show_setpoint_check.isChecked())
+
+        if result.get('error_rms') is not None:
+            self._influx_writer.put({
+                'channel': str(requested_ch),
+                'error_rms': result['error_rms'],
+                'output_mean': result['output_mean'],
+            })
 
     @define_state(_ALL_DEVICE_MODES, True, True)
     def _on_psd_stats_tick(self):

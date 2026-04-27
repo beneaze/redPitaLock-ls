@@ -165,6 +165,8 @@ class RPLockboxWorker(Worker):
         """
         t0 = time.monotonic()
         acq_error = None
+        _error_rms = None
+        _output_mean = None
         try:
             sc = self.rp.scope
             saved_in1 = sc.input1
@@ -186,6 +188,12 @@ class RPLockboxWorker(Worker):
             self._trace_bufs['in2'].append(float(ch2.mean()))
             self._trace_bufs['out1'].append(float(out1.mean()))
             self._trace_bufs['out2'].append(float(out2.mean()))
+
+            ch_input = ch1 if channel == 0 else ch2
+            ch_output = out1 if channel == 0 else out2
+            sp = float(self.pids[channel].setpoint)
+            _error_rms = float(np.sqrt(np.mean((ch_input - sp) ** 2)))
+            _output_mean = float(ch_output.mean())
         except Exception as e:
             LOG.exception('get_trace_data acquisition failed')
             msg = str(e).replace('\n', ' ')
@@ -215,6 +223,8 @@ class RPLockboxWorker(Worker):
             'input': list(self._trace_bufs[in_key]),
             'output': list(self._trace_bufs[out_key]),
             'setpoint': float(pid.setpoint),
+            'error_rms': _error_rms,
+            'output_mean': _output_mean,
         }
         if acq_error is not None:
             result['error'] = acq_error
